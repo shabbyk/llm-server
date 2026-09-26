@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# llm-run — run a command with the render group active, preserving argv.
+#
+# Why this exists: on most distributions /dev/dri/renderD128 is root:render mode
+# 0660, and `usermod -aG` only affects *new* login sessions. A shell opened
+# before the change still gets EACCES, and Vulkan then reports no device at all.
+# The installer's usermod leaves you in exactly that state until you log out and
+# back in, so something has to bridge the gap.
+#
+# newgrp(1) is setgid-root, which makes it the only way a non-root user can pick
+# up a supplementary group without a fresh login. setpriv(1) cannot do this:
+# setgroups(2) requires CAP_SETGID, so `setpriv --init-groups` returns EPERM.
+#
+# Why argv travels through the environment: newgrp runs getopt over every
+# argument and then re-execs the command with an EMPTY argv. So
+#   `newgrp render cmd -- -ngl 99`   dies with "invalid option -- 'n'"
+#   `newgrp render -- cmd -- -ngl 99` runs, but loses every argument.
+# Neither is usable, so the argument list is quoted into LLM_RUN_ARGV here and
+# restored with eval on the far side.
+#
+# This is a no-op once you can open the render node yourself (i.e. after your
+# next full login); it then just execs directly.
+
+# Already inside the shim (second pass) — restore argv and run.
+if [ "${LLM_RENDER_GROUP:-0}" = 1 ]; then
+    eval "set -- $LLM_RUN_ARGV"
+    exec "$@"
+fi
+
+# No render node, or we can already open it: nothing to bridge.
+if [ ! -e /dev/dri/renderD128 ] && [ -z "$(ls /dev/dri/renderD* 2>/dev/null)" ]; then
+    exec "$@"
+fi
+
+# Source config for the group name, but do not depend on it: llm-run must work
+# even if the config is missing or half-written.
+# shellcheck disable=SC1091
+[ -f "${LLM_DIR:-$HOME/llm}/common.sh" ] && . "${LLM_DIR:-$HOME/llm}/common.sh"
+group="${LLM_RENDER_GROUP_NAME:-render}"
+
+# If we can already open a render node, the group is effectively present.
+if python3 - <<'PY' 2>/dev/null
+import glob, os, sys
+# Exit 0 if we can open at least one node (shim not needed), 1 otherwise.
+# Existence is not enough: the whole problem is a node that exists but returns
+# EACCES, so opening is the only meaningful test.
+for n in sorted(glob.glob("/dev/dri/renderD*")):
+    try:
+        os.close(os.open(n, os.O_RDWR))
+    except OSError:
+        continue
+    sys.exit(0)
+sys.exit(1)
+PY
+then
+    exec "$@"
+fi
+
+# No newgrp, or no such group: run directly and let the failure speak for itself.
+command -v newgrp >/dev/null 2>&1 || exec "$@"
+getent group "$group" >/dev/null 2>&1 || exec "$@"
+
+LLM_RENDER_GROUP=1
+LLM_RUN_ARGV="$(printf '%q ' "$@")"
+export LLM_RENDER_GROUP LLM_RUN_ARGV
+exec newgrp "$group" -c "$0"

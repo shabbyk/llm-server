@@ -1,0 +1,16 @@
+# Runtime state, never commit these.
+models/
+logs/
+llama-b*/
+*.gguf
+*.log
+
+# Local configuration (may hold a LAN IP or a token).
+config.env
+
+# Scratch
+*.tmp
+*.part
+.DS_Store
+__pycache__/
+*.pyc
