@@ -220,6 +220,7 @@ Otherwise put a proxy with auth in front of it.
 
 ```
 install.sh              one-shot installer
+dry-run.sh              check a machine before installing (see below)
 config.env.example      every setting, documented
 src/common.sh           config, host detection, DRM helpers
 src/llm-run             render-group shim (self-disabling)
@@ -233,6 +234,35 @@ src/bench.sh            llama-bench wrapper
 
 Models in `~/llm/models/`, logs in `~/llm/logs/`, binaries in `~/llm/llama/`.
 None of that is in git.
+
+## Checking a machine first
+
+`dry-run.sh` answers whether a box can run this, without installing anything.
+With no flags it only reads, so it is safe to run anywhere:
+
+```sh
+git clone https://github.com/shabbyk/llm-server.git
+cd llm-server
+./dry-run.sh
+```
+
+It reports your glibc against the 2.34 the prebuilt binary needs, whether the
+architecture has a build, free RAM and disk, whether you can reach the render
+node, and — on an AMD card — whether the `gc_11_0_3` firmware blobs are there.
+It exits non-zero if something will actually stop you.
+
+Go further only once that looks clean:
+
+```sh
+./dry-run.sh --install     # install into ~/llm-dryrun, no models
+./dry-run.sh --model       # also fetch one quant, then start and stop it
+./dry-run.sh --clean       # remove everything the above created
+```
+
+`--install` repoints `~/.local/bin/llm` at the throwaway directory. It saves
+where that symlink used to point and `--clean` puts it back, so it is safe on a
+machine that already has this installed. If you cannot sudo, add `--skip-deps`
+and install the packages yourself.
 
 ## Thinking is off by default
 
