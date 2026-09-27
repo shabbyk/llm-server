@@ -45,15 +45,23 @@ llm_detect_host() {
 LLM_HOST="${LLM_HOST:-$(llm_detect_host)}"
 LLM_PORT="${LLM_PORT:-8080}"
 
-# Context length. 16384 is a safe default on an 8 GB card. KV cache costs
-# roughly 17 MiB per 1024 tokens for Qwen3.5-9B at q8_0, and it does not slow
-# decode — it only costs prefill time on very long prompts. Verified to load at
-# 16384 / 24576 / 32768 on an RX 6600; 32768 is not guaranteed on smaller cards.
+# Context length. KV cache costs roughly 17 MiB per 1024 tokens for Qwen3.5-9B at
+# q8_0, and it does not slow decode — it only costs prefill time on very long
+# prompts. Verified to load at 16384 (272 MiB) / 24576 (408 MiB) / 32768 (544 MiB)
+# on an RX 6600; 32768 is the ceiling there, not a preference.
+#
+# 32768 is the default because agentic clients need it. OpenCode's own system
+# prompt plus its tool definitions measure 6619 tokens, sent on every request
+# before you type anything. At 16384 with a typical 4096-token output reserve,
+# that leaves under 2000 tokens of real conversation and it starts compacting
+# almost immediately. Drop to 16384 only if you are calling this from plain
+# scripts and do not want the KV reservation. On a card with less than 8 GB,
+# start at 16384.
 #
 # Do NOT size this against the VRAM counter. amdgpu backs the model with either
 # VRAM or GTT and migrates between them at runtime, so mem_info_vram_used is not
 # a usable capacity signal on at least some drivers. See README.
-LLM_CTX="${LLM_CTX:-16384}"
+LLM_CTX="${LLM_CTX:-32768}"
 LLM_THREADS="${LLM_THREADS:-$(nproc 2>/dev/null || echo 4)}"
 LLM_NGL="${LLM_NGL:-99}"
 
