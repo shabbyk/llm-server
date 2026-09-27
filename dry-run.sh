@@ -175,6 +175,7 @@ fi
 head_ "GPU (informational, will not fail the run)"
 
 GPU_FOUND=0
+GPU_LINE=""
 if command -v lspci >/dev/null 2>&1; then
     GPU_LINE="$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display' | head -3)"
     if [ -n "$GPU_LINE" ]; then
@@ -220,15 +221,25 @@ else
 fi
 
 if [ "$VENDOR" = "amd" ]; then
-    printf '  amdgpu blobs (Navi 2 / RX 6000 needs gc_11_0_3):\n'
-    BLOBS="$(ls /lib/firmware/amdgpu/gc_11_0_3* 2>/dev/null | wc -l)"
-    if [ "$BLOBS" -ge 7 ]; then
-        ok "$BLOBS gc_11_0_3 blobs present"
-    elif [ "$BLOBS" -gt 0 ]; then
-        warn "only $BLOBS of 7 gc_11_0_3 blobs present, firmware is incomplete"
+    # The gc_11_0_3 blobs are specific to Navi 2 (RX 6000). Any other AMD card
+    # does not want them, so only ask when the card actually looks like one.
+    # Everything else is answered by amdgpu having claimed the card at all,
+    # which the /dev/dri listing above already shows.
+    if [ -z "$GPU_LINE" ]; then
+        note "lspci gave no name, cannot tell which AMD card this is"
+    elif printf '%s' "$GPU_LINE" | grep -qiE 'navi ?2[0-9]|rx ?6[0-9]{3}'; then
+        printf '  Navi 2 firmware (this card needs the gc_11_0_3 blobs):\n'
+        BLOBS="$(ls /lib/firmware/amdgpu/gc_11_0_3* 2>/dev/null | wc -l)"
+        if [ "$BLOBS" -ge 7 ]; then
+            ok "$BLOBS of 7 gc_11_0_3 blobs present"
+        elif [ "$BLOBS" -gt 0 ]; then
+            warn "only $BLOBS of 7 gc_11_0_3 blobs, firmware is incomplete"
+        else
+            warn "no gc_11_0_3 blobs. On Debian that means non-free-firmware is not enabled."
+            note "bookworm ships a firmware-amd-graphics too old for these; use backports or trixie"
+        fi
     else
-        warn "no gc_11_0_3 blobs. On Debian that means non-free-firmware is not enabled."
-        note "bookworm ships a firmware-amd-graphics too old for these; use backports or trixie"
+        printf '  firmware: not a Navi 2 card, the RX 6000 blob check does not apply\n'
     fi
 fi
 
