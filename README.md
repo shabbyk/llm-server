@@ -14,7 +14,8 @@ and it has no Vulkan runner. llama.cpp ships one Vulkan backend that covers AMD,
 Intel and Apple Silicon with the same binary.
 
 Tested on Ubuntu 26.04, Ryzen 5 5600X, RX 6600 (8 GB), Mesa 26.0.8,
-Vulkan 1.4.335, llama.cpp b11146.
+Vulkan 1.4.335, llama.cpp b11146. Debian 13 and 12 work too, with one extra step
+— see [Debian](#debian).
 
 ## Requirements
 
@@ -22,6 +23,39 @@ Vulkan 1.4.335, llama.cpp b11146.
 - A GPU with a working Vulkan driver
 - ~13 GB of disk for both quantisations
 - `sudo` available for packages and group membership
+
+## Debian
+
+Works, with two things to sort out first.
+
+**Use Debian 13 (trixie) or 12 (bookworm).** Debian 11 is too old. There is no
+Debian build of llama.cpp, so this downloads the Ubuntu one, and that binary
+needs glibc 2.34 — bookworm has 2.36, bullseye only has 2.31, and it will not
+run.
+
+**Turn on `non-free-firmware` before installing.** On Debian the GPU firmware
+lives there rather than inside `linux-firmware` as it does on Ubuntu, and without
+it an RX 6000-series card can fail to start properly. Substitute your own suite
+for `trixie` below — do not paste a different suite onto your system:
+
+```sh
+echo "deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware" \
+  | sudo tee /etc/apt/sources.list.d/non-free.list
+sudo apt update
+```
+
+`install.sh` installs `firmware-amd-graphics` for you and warns if it could not.
+
+Check the blobs landed, because this is the one thing that quietly goes wrong:
+
+```sh
+ls /lib/firmware/amdgpu/gc_11_0_3*
+```
+
+Seven files should be listed. If nothing comes back, the card is on the wrong
+firmware, and the check above is how you know. Bookworm is reported to ship a
+`firmware-amd-graphics` too old to carry these, so on bookworm expect to need
+`bookworm-backports`. Trixie carries a current one and should be fine as-is.
 
 ## Quick start
 
@@ -148,6 +182,10 @@ to walk past. `install.sh` installs it and checks with `ldd` afterwards.
 belongs to the `render` group, and `usermod -aG` only affects new logins, so a
 shell you already have open still gets `EACCES`. Log out and back in. `llm status`
 measures speed, so it gives you the truth either way.
+
+**The card is missing entirely on Debian.** Usually firmware. `ls
+/lib/firmware/amdgpu/gc_11_0_3*` should list seven files. Empty means the card is
+on the wrong blobs — see [Debian](#debian).
 
 **`common_fit_params: ... n_gpu_layers already set by user to 99, abort`** and
 **`cannot meet free memory target`**. Both harmless.

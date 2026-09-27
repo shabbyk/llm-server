@@ -127,8 +127,17 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
     # The Vulkan driver package name is Mesa-specific. On NVIDIA you need the
     # proprietary ICD instead, which this script does not attempt to install.
     PKGS="curl tmux python3 libgomp1 libvulkan1 vulkan-tools"
-    if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
+    FW_PKGS=""
+    if [ "$ID" = "ubuntu" ]; then
         PKGS="$PKGS mesa-vulkan-drivers"
+    elif [ "$ID" = "debian" ]; then
+        PKGS="$PKGS mesa-vulkan-drivers"
+        # Debian keeps the amdgpu blobs in their own package rather than inside
+        # linux-firmware, and it sits in non-free-firmware, so a stock
+        # sources.list does not have it. A Navi 2 card (RX 6600) needs the
+        # gc_11_0_3 blobs from it. Best-effort, so a missing component does not
+        # abort an otherwise fine install.
+        FW_PKGS="firmware-amd-graphics"
     elif [ "$ID" = "fedora" ]; then
         PKGS="$PKGS vulkan-loader vulkan-tools mesa-vulkan-drivers"
     elif [ "$ID" = "arch" ]; then
@@ -147,6 +156,17 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
         || $SUDO pacman -S --noconfirm --needed $PKGS 2>/dev/null \
         || die "package installation failed. Install these by hand: $PKGS"
     ok "packages present"
+
+    if [ -n "$FW_PKGS" ]; then
+        # shellcheck disable=SC2086
+        if $SUDO apt-get install -y -qq $FW_PKGS 2>/dev/null; then
+            ok "$FW_PKGS"
+        else
+            warn "could not install $FW_PKGS."
+            warn "on Debian it lives in non-free-firmware. Without those blobs an"
+            warn "RX 6000-series card can fail to initialise or lose acceleration."
+        fi
+    fi
 else
     step "System packages"
     info "skipped (--skip-deps)"
