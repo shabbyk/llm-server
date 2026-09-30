@@ -5,6 +5,13 @@ llama-b*/
 *.gguf
 *.log
 
+# TTS runtime tree. By default it lives outside the repo at ~/tts, but point
+# TTS_DIR at tts/ and these rules keep the heavy and private parts untracked.
+# voices/ in particular holds your own voice recordings — do not commit those.
+tts/bin/
+tts/voices/
+tts/out/
+
 # Local configuration (may hold a LAN IP or a token).
 config.env
 
@@ -14,3 +21,6 @@ config.env
 .DS_Store
 __pycache__/
 *.pyc
+
+# Rust build output.
+target/

@@ -357,6 +357,27 @@ case ":$PATH:" in
     *) warn "$BINDIR is not on your PATH yet. Either 'exec bash -l' or run ~/.local/bin/llm by full path." ;;
 esac
 
+# -------------------------------------------------------------- tts (Rust) --
+# The TTS wrapper is a single Rust binary. There is no install step beyond
+# building it: the runtime tree (models, the koboldcpp binary, voices) lives in
+# $HOME/tts and is created by the user, not copied from here.
+if [ -d "$REPO_DIR/tts" ]; then
+    step "TTS wrapper"
+    if command -v cargo >/dev/null 2>&1; then
+        if (cd "$REPO_DIR/tts" && cargo build --release) >/dev/null 2>&1; then
+            ln -sfn "$REPO_DIR/tts/target/release/tts" "$BINDIR/tts"
+            ok "built and linked $BINDIR/tts"
+        else
+            warn "cargo build failed — run it by hand to see why:"
+            warn "    cd $REPO_DIR/tts && cargo build --release"
+        fi
+    else
+        warn "cargo not found, skipping the TTS wrapper."
+        warn "Install Rust (https://rustup.rs), then:"
+        warn "    cd $REPO_DIR/tts && cargo build --release && ln -sfn \$PWD/target/release/tts $BINDIR/tts"
+    fi
+fi
+
 # ---------------------------------------------------------------- verify ---
 step "Verifying"
 # The real check is whether a hardware device is visible from a process that

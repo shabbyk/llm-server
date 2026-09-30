@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3-TTS</title>
+<style>
+  :root { --bg:#14161a; --panel:#1c1f26; --line:#2b303a; --fg:#e6e8ec;
+          --dim:#9aa3b2; --acc:#6aa9ff; --ok:#5ddc9a; --warn:#ffc46b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:820px; margin:0 auto; padding:24px 20px 60px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px; }
+  .bar { display:flex; gap:14px; align-items:center; flex-wrap:wrap;
+         font-size:12px; color:var(--dim); margin-bottom:18px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#666; display:inline-block; }
+  .dot.up { background:var(--ok); } .dot.down { background:#e05c5c; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:16px; margin-bottom:16px; }
+  label { display:block; font-size:12px; color:var(--dim);
+          text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px; }
+  textarea, select, input[type=file] { width:100%; background:#12141a;
+          color:var(--fg); border:1px solid var(--line); border-radius:7px;
+          padding:10px; font:inherit; }
+  textarea { min-height:110px; resize:vertical; }
+  select { margin-bottom:14px; }
+  button { background:var(--acc); color:#0b1220; border:0; border-radius:7px;
+           padding:10px 18px; font:inherit; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .msg { margin-top:12px; font-size:13px; min-height:20px; }
+  .msg.err { color:#ff8f8f; } .msg.ok { color:var(--ok); } .msg.busy { color:var(--warn); }
+  audio { width:100%; margin-top:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; font-size:11px; text-transform:uppercase; }
+  .tag { font-size:11px; padding:1px 7px; border-radius:99px; border:1px solid var(--line); color:var(--dim); }
+  .tag.clone { color:var(--ok); border-color:#2c5c46; }
+  .tag.stale { color:var(--warn); border-color:#5c4a2c; }
+  .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+  code { background:#12141a; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .warn { border-left:3px solid var(--warn); padding-left:12px; }
+</style></head>
+<body><div class="wrap">
+  <h1>Qwen3-TTS</h1>
+  <div class="sub">Local text-to-speech and zero-shot voice cloning</div>
+
+  <div class="bar">
+    <span><span class="dot" id="dot"></span> TTS on __PORT__</span>
+    <span>backend: <b id="backend">?</b></span>
+    <span id="count"></span>
+    <button class="ghost" style="padding:4px 10px;font-size:12px"
+            onclick="refresh()">Refresh voices</button>
+  </div>
+
+  <div class="panel">
+    <label for="voice">Voice</label>
+    <select id="voice"></select>
+    <label for="text">Text</label>
+    <textarea id="text" placeholder="Type anything to speak..."></textarea>
+    <div class="row" style="margin-top:12px">
+      <button id="go" onclick="speak()">Generate</button>
+      <span style="color:var(--dim);font-size:12px" id="timing"></span>
+    </div>
+    <div class="msg" id="msg"></div>
+    <audio id="player" controls></audio>
+  </div>
+
+  <div class="panel">
+    <label for="file">Attach a voice &mdash; upload a reference clip</label>
+    <input type="file" id="file" accept=".wav,.mp3">
+    <div class="row" style="margin-top:12px">
+      <button class="ghost" onclick="doUpload()">Upload &amp; activate</button>
+    </div>
+    <div class="msg" id="upmsg"></div>
+    <div class="hint warn">
+      A new clip cannot be picked up without restarting the TTS server, because
+      KoboldCpp scans the voices folder once at startup. That takes about ten
+      seconds and the page will say so while it happens.<br><br>
+      For the clone to be any good, record <b>3&ndash;10s</b> of
+      <b>one speaker only</b>, no music or echo, natural connected speech with
+      some pitch movement. The clip is the entire model of your voice &mdash;
+      nothing is trained.
+    </div>
+  </div>
+
+  <div class="panel">
+    <label>Available voices</label>
+    <table><thead><tr><th>Name</th><th>Kind</th><th>Length</th></tr></thead>
+    <tbody id="vlist"></tbody></table>
+    <div class="hint">
+      <b>stale</b> means the reference file was deleted but the TTS server has
+      not restarted, so the name is still served from its in-memory cache. It
+      will still generate audio, and disappears at the next restart.
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const setMsg = (el, msg, cls) => { el.textContent = msg || ''; el.className = 'msg ' + (cls||''); };
+
+async function refresh() {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    $('dot').className = 'dot ' + (h.tts_up ? 'up' : 'down');
+    $('backend').textContent = h.backend;
+    if (h.restarting) { $('go').disabled = true; setMsg($('msg'), 'TTS restarting...', 'busy'); }
+    else if (h.tts_up) { $('go').disabled = false; }
+  } catch (e) { $('dot').className = 'dot down'; }
+
+  try {
+    const d = await (await fetch('/api/voices')).json();
+    const sel = $('voice'), prev = sel.value;
+    sel.innerHTML = '';
+    for (const v of d.voices) {
+      const o = document.createElement('option');
+      o.value = v.name;
+      o.textContent = v.name + (v.cloned ? '  (your reference)' : '');
+      sel.appendChild(o);
+    }
+    if (prev) sel.value = prev;
+    $('count').textContent = d.voices.length + ' voices';
+
+    $('vlist').innerHTML = d.voices.map(v =>
+      '<tr><td><code>' + v.name + '</code></td><td>' +
+      (v.stale ? '<span class="tag stale">stale</span>'
+               : v.cloned ? '<span class="tag clone">cloned</span>'
+                          : '<span class="tag">built-in</span>') +
+      '</td><td>' + (v.duration != null ? v.duration + 's' : '&mdash;') + '</td></tr>'
+    ).join('');
+  } catch (e) {
+    $('vlist').innerHTML = '<tr><td colspan="3" style="color:#ff8f8f">' +
+      'Could not load voices: ' + e.message + '</td></tr>';
+  }
+}
+
+async function speak() {
+  const text = $('text').value.trim();
+  if (!text) { setMsg($('msg'), 'Type some text first.', 'err'); return; }
+  $('go').disabled = true;
+  setMsg($('msg'), 'Generating...', 'busy');
+  $('player').removeAttribute('src');
+  try {
+    const fd = new FormData();
+    fd.append('text', text);
+    fd.append('voice', $('voice').value);
+    const r = await fetch('/api/speak', { method: 'POST', body: fd });
+    if (!r.ok) {
+      let m = 'HTTP ' + r.status;
+      try { m = (await r.json()).detail || m; } catch (e) {}
+      setMsg($('msg'), m, 'err');
+      return;
+    }
+    const blob = await r.blob();
+    $('player').src = URL.createObjectURL(blob);
+    const secs = r.headers.get('X-Elapsed-Sec'), aud = r.headers.get('X-Audio-Sec');
+    let t = '';
+    if (secs && aud && +aud > 0) t = secs + 's to make ' + aud + 's of audio (RTF ' + (secs / +aud).toFixed(2) + ')';
+    setMsg($('msg'), t || 'Done.', 'ok');
+  } catch (e) {
+    setMsg($('msg'), 'Failed: ' + e.message, 'err');
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+async function doUpload() {
+  const f = $('file').files[0];
+  if (!f) { setMsg($('upmsg'), 'Choose a .wav or .mp3 first.', 'err'); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  $('go').disabled = true;
+  setMsg($('upmsg'), 'Uploading, then restarting the TTS server (~10s)...', 'busy');
+  try {
+    const r = await fetch('/api/voices/upload', { method: 'POST', body: fd });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { setMsg($('upmsg'), d.detail || ('HTTP ' + r.status), 'err'); return; }
+    setMsg($('upmsg'), d.message, 'ok');
+    $('file').value = '';
+    await refresh();
+  } catch (e) {
+    setMsg($('upmsg'), 'Failed: ' + e.message, 'err');
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+$('text').addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') speak();
+});
+</script>
+</body></html>

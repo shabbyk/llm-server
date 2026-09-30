@@ -229,10 +229,30 @@ src/start.sh stop.sh    process lifecycle
 src/status.sh           state + GPU memory
 src/ask.sh ask.py       HTTP client (thinking off by default)
 src/bench.sh            llama-bench wrapper
+tts/                    text-to-speech wrapper (see tts/README.md)
 ```
 
 Models in `~/llm/models/`, logs in `~/llm/logs/`, binaries in `~/llm/llama/`.
 None of that is in git.
+
+## Text to speech
+
+`tts/` is a separate component: one Rust binary that supervises a KoboldCpp
+TTS server and serves a small web UI on port 8081, including a form to upload a
+reference clip for zero-shot voice cloning. It shares nothing with the LLM
+server except the machine — different port, different process, different runtime
+directory (`~/tts`).
+
+```bash
+tts up          # start; returns when ready
+tts say "Hello there." -v me.wav -o out.wav
+tts down
+```
+
+See [tts/README.md](tts/README.md) for the full guide, including the one
+permanent limitation worth knowing before you spend time tuning a reference
+clip: KoboldCpp never forwards the reference transcript, so clone quality is
+capped by design.
 
 ## Thinking is off by default
 
