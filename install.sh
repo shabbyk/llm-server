@@ -15,7 +15,6 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ---------------------------------------------------------------- defaults --
-LLM_DIR="${LLM_DIR:-$HOME/llm}"
 LLM_BUILD="${LLM_BUILD:-b11146}"       # llama.cpp release tag; "latest" works
 LLM_REPO="${LLM_REPO:-unsloth/Qwen3.5-9B-GGUF}"
 LLM_MODELS_WANTED="q6 q4"
@@ -35,6 +34,31 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '%s    warning:%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '%s    error:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 ok()   { printf '%s    ok%s %s\n' "$G" "$N" "$*"; }
+
+# ------------------------------------------------- invoking user's home ----
+# This installer is meant to run as the person who will use it; it elevates
+# internally for apt and group membership only. Started as `sudo ./install.sh`
+# it inherits $HOME=/root, and then models, binaries, ~/.local/bin/llm and the
+# .bashrc edit all land in root's home instead of the caller's. So anchor
+# everything on the account that actually typed the command.
+INVOKER_USER="$(id -un)"
+if [ "$(id -u)" -eq 0 ]; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        INVOKER_USER="$SUDO_USER"
+    else
+        die "refusing to run as root with no invoking user: \$HOME is $HOME, so the install
+  would land in root's home. Run it as yourself -- it calls sudo internally for
+  packages and group membership. To install as root on purpose, pass --dir explicitly."
+    fi
+fi
+INVOKER_HOME="$(getent passwd "$INVOKER_USER" | cut -d: -f6)"
+[ -n "$INVOKER_HOME" ] || die "cannot resolve the home directory of '$INVOKER_USER'"
+
+# Downstream steps write to $HOME (the switch symlink, .bashrc) and to
+# $LLM_DIR; keep both pointed at the human, not at the apt-capable account.
+HOME="$INVOKER_HOME"
+export HOME
+LLM_DIR="${LLM_DIR:-$HOME/llm}"
 
 usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; }
 
@@ -82,7 +106,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     fi
     # Group membership is deliberately left alone: removing it is a system-wide
     # change that other software on the box may depend on.
-    warn "group membership (video/render) left as-is; remove by hand with 'sudo gpasswd -d $USER render' if you are sure"
+    warn "group membership (video/render) left as-is; remove by hand with 'sudo gpasswd -d $INVOKER_USER render' if you are sure"
     step "Done."
     exit 0
 fi
@@ -202,10 +226,10 @@ if [ -e /dev/dri/renderD128 ] || ls /dev/dri/renderD* >/dev/null 2>&1; then
         ok "already in group '$GRP'"
     else
         if [ "$SKIP_DEPS" -eq 0 ] && [ -n "$SUDO" ]; then
-            $SUDO usermod -aG "$GRP" "$(id -un)" 2>/dev/null || warn "could not add you to '$GRP'"
+            $SUDO usermod -aG "$GRP" "$INVOKER_USER" 2>/dev/null || warn "could not add you to '$GRP'"
             ok "added you to '$GRP' — takes effect at your next login"
         else
-            warn "not in group '$GRP'. Run: sudo usermod -aG $GRP $(id -un)"
+            warn "not in group '$GRP'. Run: sudo usermod -aG $GRP $INVOKER_USER"
         fi
         warn "until you log out and back in, the llm-run shim bridges this by re-execing under 'newgrp'"
     fi
@@ -228,9 +252,16 @@ TARBALL="llama-${LLM_BUILD}-bin-ubuntu-vulkan-${ARCH_TAG}.tar.gz"
 URL="https://github.com/ggml-org/llama.cpp/releases/download/${LLM_BUILD}/${TARBALL}"
 
 if [ -x "$BIN_DIR/llama-server" ]; then
-    have="$("$BIN_DIR/llama-server" --version 2>/dev/null | head -1)"
-    info "already installed: $have"
-    if [ "${have##*build }" != "${LLM_BUILD#b}" ] && [ "${have##*build }" != "$LLM_BUILD" ]; then
+    # llama-server writes its version banner to stderr, not stdout, so capture
+    # both streams or `have` comes back empty. Extract the build number rather
+    # than the whole line: the banner is preceded by a timestamped log line, and
+    # a plain ${have##*build } would also drag along ", commit 7fe450e19)".
+    have="$("$BIN_DIR/llama-server" --version 2>&1 \
+            | sed -n 's/.*[^0-9]build \([0-9]\{1,\}\).*/\1/p' | head -1)"
+    info "already installed: build ${have:-unknown} (want $LLM_BUILD)"
+    # Only complain when a number was actually read: an unreadable banner is not
+    # evidence of a mismatch, and warning here invites deleting a working install.
+    if [ -n "$have" ] && [ "$have" != "${LLM_BUILD#b}" ] && [ "$have" != "$LLM_BUILD" ]; then
         warn "that is a different build than $LLM_BUILD; delete $BIN_DIR to change it"
     fi
     ok "binaries present"
