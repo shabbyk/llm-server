@@ -9,6 +9,7 @@
 #   ./install.sh --llamacpp-only
 #   ./install.sh --rag-only
 #   ./install.sh --force      # reinstall things that are already present
+#   ./install.sh --uninstall  # remove the stack (forwards to uninstall.sh)
 #
 # Three independent pieces:
 #
@@ -127,6 +128,14 @@ ask_choice() { # prompt default_index option...
            fi ;;
     esac
 }
+
+# Uninstall lives in its own script, because deleting is a different kind of
+# operation from installing and deserves to be read and reviewed on its own. This
+# forwards to it so there is still just one entry point to remember.
+if [ "${1:-}" = "--uninstall" ]; then
+    shift
+    exec "$REPO_DIR/uninstall.sh" "$@"
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -814,6 +823,12 @@ cat <<EOF
   Models and config live in $LLM_DIR.
   TTS weights and voices live in $TTS_DIR.
   Neither directory is in git.
+
+  To remove the whole stack later:
+
+    ./uninstall.sh --dry-run    show what would go, change nothing
+    ./uninstall.sh              remove the software, keep your models
+    ./uninstall.sh --purge      remove the ~14 GB of downloads too
 EOF
 
 if [ "$WANT_RAG" = 1 ]; then

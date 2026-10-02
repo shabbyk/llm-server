@@ -415,6 +415,7 @@ The defaults are chosen so the *unsafe* option is the one you have to ask for.
 
 ```
 install.sh              the installer
+uninstall.sh            the remover: software, data, or everything
 config.env.example      LLM settings, documented
 src/common.sh           shared config and helpers, engine-aware
 src/llm                 the LLM switch (either engine)
@@ -445,6 +446,44 @@ Source lives here. Runtime state does not:
 
 Both engines may be installed at once. They are separate programs on separate
 ports, so only one runs at a time and switching is just `llm restart`.
+
+## Uninstall
+
+```sh
+./uninstall.sh --dry-run     # show what would go; change nothing
+./uninstall.sh               # remove the software, keep your data
+./uninstall.sh --purge       # also remove the ~14 GB of downloads
+./uninstall.sh --purge-all   # ...and your voice clips, documents, chats
+./uninstall.sh --llm --rag   # only those components
+```
+
+`./install.sh --uninstall` forwards to the same script, so there is one entry
+point to remember.
+
+The tiers are the design, not an afterthought:
+
+| Tier | Reclaims | Removes |
+|---|---|---|
+| **default** | ~5 GB | runtimes, virtualenvs, the `llm`/`tts`/`webui`/`rag` commands, the `~/.bashrc` line |
+| **`--purge`** | ~14 GB more | models and weights, plus logs and configs |
+| **`--purge-all`** | the rest | your voice clips, documents and chat history |
+
+Software goes by default and data stays, because the two have very different
+replacement costs. A runtime is one download you can repeat; 14 GB of models and
+weights is an afternoon; and a cloned voice clip cannot be recovered at all.
+`--purge-all` is the only thing that touches the last category, and it says so in
+red before asking.
+
+`--dry-run` prints the real plan — it is built from the same list the removal
+uses, so the preview cannot drift from what would actually happen.
+
+Three things it never removes:
+
+- **apt packages** (`build-essential`, `libvulkan1`) — shared with the rest of
+  the machine. It prints the exact `apt remove` line for you to decide.
+- **The Rust toolchain** — another project here may depend on it. Opt in with
+  `--remove-toolchain`.
+- **The repository clone** — you are running the script from it.
 
 ## Troubleshooting
 
