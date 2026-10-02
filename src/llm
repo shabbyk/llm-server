@@ -1,148 +1,199 @@
 #!/usr/bin/env bash
-# On/off switch for the local LLM server.
+# On/off switch for the local LLM server, backed by Ollama.
 #
 #   llm              # same as "llm status"
-#   llm on           # start  (Q6_K on the configured port)
-#   llm on q4        # start  (Q4_K_M instead)
-#   llm on q6 9090   # start  (different port)
-#   llm off          # stop, and confirm GPU memory was released
+#   llm on           # start the server, load the model, wait until ready
+#   llm off          # unload the model, stop the server, confirm VRAM released
 #   llm toggle       # flip: off if running, on if not
-#   llm toggle q4    # flip, starting with q4 if it was off
-#   llm restart [q6|q4] [port]
-#   llm status       # state, GPU memory, health
-#   llm log          # tail the current log
-#   llm watch        # attach to the tmux session (Ctrl-b d to detach)
+#   llm restart
+#   llm status       # state, model, where it loaded, context, GPU memory
+#   llm models       # what is installed, and how big
+#   llm pull [tag]   # fetch a model (default: the configured one)
+#   llm log          # follow the server log
+#   llm watch        # same thing; kept because the old tmux build had it
 #   llm help         # this list
 #
 # Nothing here starts automatically. After a reboot it stays off until you say
-# "llm on". That is deliberate: it is a switch, not a service.
+# "llm on". That is deliberate: it is a switch, not a service. The installer
+# deliberately does not create a systemd unit, so there is nothing to fight.
 
 set -uo pipefail
 # shellcheck disable=SC1091
-. "${LLM_DIR:-$HOME/llm}/common.sh"
+# Resolve through symlinks first: the installer links this into ~/.local/bin,
+# and BASH_SOURCE would otherwise name the link rather than the script.
+LLM_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+. "$LLM_SRC/common.sh"
 
 die() { echo "llm: $*" >&2; exit 2; }
 
-# Is a server actually up? Ask the process, not tmux: a tmux session can outlive
-# the server if it was killed by hand, and pgrep -f would match this script.
-is_running() { pgrep -x llama-server >/dev/null; }
-
-# The preset currently in use, read back from the live process's argv.
-current_preset() {
-    local pid args
-    pid="$(pgrep -x llama-server | head -1)" || return 1
-    [ -n "$pid" ] || return 1
-    args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
-    case "$args" in
-        *Q6_K*)   echo q6 ;;
-        *Q4_K_M*) echo q4 ;;
-        *)        echo "?" ;;
-    esac
+require_ollama() {
+    [ -x "$OLLAMA_BIN" ] || {
+        echo "llm: ollama not found at $OLLAMA_BIN" >&2
+        echo "     Run the installer: ./install.sh" >&2
+        exit 1
+    }
 }
 
-gpu_counters() {
-    local d
-    d="$(llm_drm_device_dir 2>/dev/null)" || { echo "  (no DRM device with memory counters)"; return; }
-    local vram gtt
-    vram="$(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0)"
-    gtt="$(cat "$d/mem_info_gtt_used" 2>/dev/null || echo 0)"
-    printf '  VRAM %s MB' "$(( vram / 1000000 ))"
-    [ -r "$d/mem_info_gtt_used" ] && printf '   GTT %s MB' "$(( gtt / 1000000 ))"
-    printf '\n'
+# Start the server detached, so it outlives the shell that launched it.
+start_server() {
+    mkdir -p "$LLM_LOGS"
+    OLLAMA_HOST="$LLM_HOST:$LLM_PORT" \
+    OLLAMA_CONTEXT_LENGTH="$LLM_CTX" \
+    OLLAMA_KEEP_ALIVE="$LLM_KEEP_ALIVE" \
+        setsid "$OLLAMA_BIN" serve >>"$LLM_LOG" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+
+    local i
+    for i in $(seq 1 30); do
+        if llm_serving; then
+            pgrep -x ollama 2>/dev/null | head -1 > "$LLM_PID"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
-do_status() {
-    if is_running; then
-        echo "llm    ON   preset $(current_preset)   pid $(pgrep -x llama-server | tr '\n' ' ')"
-    else
-        echo "llm    OFF"
-    fi
-
-    "$LLM_DIR/status.sh"
-
-    if is_running; then
-        echo "  url      http://$LLM_HOST:$LLM_PORT"
-        echo "  ask      $LLM_DIR/ask.sh \"your question\""
-    fi
+# Load the weights and return, generating nothing. An empty prompt is the
+# cheapest way to get the model resident and measure where it landed.
+preload_model() {
+    curl -sS --max-time 600 "$(llm_base)/api/generate" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$LLM_MODEL\",\"prompt\":\"\",
+             \"keep_alive\":\"$LLM_KEEP_ALIVE\",
+             \"options\":{\"num_ctx\":$LLM_CTX}}" \
+        -o /dev/null 2>/dev/null
 }
 
 do_on() {
-    local preset="${1:-q6}" port="${2:-$LLM_PORT}"
-
-    if is_running; then
-        echo "llm: already ON (preset $(current_preset), pid $(pgrep -x llama-server | tr '\n' ' '))." >&2
-        echo "llm: use 'llm off' first if you meant to restart." >&2
+    require_ollama
+    if llm_serving && [ -n "$(llm_loaded_model)" ]; then
+        echo "llm: already ON ($(llm_loaded_model) loaded). Use 'llm off' first if you meant to restart." >&2
         return 1
     fi
 
-    if ! command -v tmux >/dev/null 2>&1; then
-        echo "llm: tmux is not installed, and the server needs it to survive your shell." >&2
-        echo "llm: install it, or set LLM_SESSION= to use another supervisor." >&2
-        return 1
-    fi
-
-    if [ ! -f "$(llm_model_path "$preset" 2>/dev/null || echo /nonexistent)" ]; then
-        echo "llm: model for preset '$preset' is not downloaded yet." >&2
-        echo "llm: run the installer, or fetch it (see README)." >&2
-        return 1
-    fi
-
-    # A leftover tmux session with no server in it is a dead pane. Clear it
-    # before starting so we never attach to nothing.
-    if tmux has-session -t "$LLM_SESSION" 2>/dev/null; then
-        tmux kill-session -t "$LLM_SESSION" 2>/dev/null || true
-    fi
-
-    "$LLM_DIR/up.sh" "$preset" "$port" || return 1
-
-    # up.sh returns as soon as tmux has the session; the model is still loading.
-    # Poll /health so "llm on" means "ready", not "process spawned".
-    #
-    # Liveness is judged by the tmux session, NOT by pgrep -x llama-server.
-    # The start chain is bash -> start.sh -> llm-run -> newgrp -> llama-server,
-    # so for the first ~100 ms there is no process named llama-server at all.
-    # Treating that gap as failure makes "llm on" abort in under 100 ms while
-    # the server is starting perfectly well.
-    printf '  loading %s' "$preset"
-    local code ready=0
-    for _ in $(seq 1 120); do
-        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
-                "http://$LLM_HOST:$port/health" 2>/dev/null)"
-        if [ "$code" = "200" ]; then ready=1; break; fi
-        if ! tmux has-session -t "$LLM_SESSION" 2>/dev/null; then
+    if ! llm_serving; then
+        printf '  starting ollama on %s:%s' "$LLM_HOST" "$LLM_PORT"
+        if ! start_server; then
             printf ' FAILED\n'
-            echo "llm: the server exited during load. Check $LLM_LOGS/${preset}-p${port}.log" >&2
+            echo "llm: the server did not answer. Check $LLM_LOG" >&2
             return 1
         fi
-        printf '.'
-        sleep 1
-    done
+        printf ' ok\n'
+    fi
 
-    if [ "$ready" -ne 1 ]; then
-        printf ' TIMEOUT\n'
-        echo "llm: no health response after 120s. Check $LLM_LOGS/${preset}-p${port}.log" >&2
+    printf '  loading %s' "$LLM_MODEL"
+    if ! preload_model; then
+        printf ' FAILED\n'
+        echo "llm: could not load the model. Is it pulled? Try: llm pull" >&2
         return 1
     fi
+
+    # Report where it actually landed. Getting a CPU load when you expected the
+    # GPU is the failure this whole script exists to make visible: it looks like
+    # a slow model rather than an error.
     printf ' ready\n'
-    return 0
+    local proc; proc="$(llm_processor)"
+    echo "  processor: ${proc:-unknown}"
+    echo "  context:   $LLM_CTX"
+    [ "${proc:-}" = "100% GPU" ] || \
+        echo "  warning: not fully on the GPU. Check the Vulkan driver and that the" >&2
+    [ "${proc:-}" = "100% GPU" ] || \
+        echo "           'ollama' user can reach /dev/dri/renderD*." >&2
 }
 
 do_off() {
-    local was=""
-    is_running && was="$(current_preset)"
-
-    "$LLM_DIR/down.sh" || return 1
-
-    if is_running; then
-        echo "llm: still running after down.sh" >&2
-        return 1
+    if ! llm_serving; then
+        echo "llm: already OFF"
+        return 0
     fi
-    # Report the release rather than assume it: this is the step where a silent
-    # failure would leave the GPU occupied with nothing using it.
-    printf '  GPU memory released: '
-    gpu_counters | sed 's/^  //'
-    [ -n "$was" ] && echo "  was serving: $was"
+
+    # Unload first so VRAM is released even if the server lingers.
+    ollama_cli stop "$LLM_MODEL" >/dev/null 2>&1 || true
+
+    # Kill by process name rather than trusting a pidfile.
+    #
+    # The pidfile records whatever `pgrep -x ollama` returned at start time,
+    # which is not guaranteed to be the process that ends up owning the port —
+    # so a stale entry made this report "stopped" while the server kept
+    # answering. Ollama has exactly one server process, so matching it by name
+    # is both simpler and correct.
+    local pids
+    pids="$(pgrep -x ollama 2>/dev/null | tr '\n' ' ')"
+    if [ -n "$pids" ]; then
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null && echo "  stopped ollama (pid ${pids% })"
+    fi
+    rm -f "$LLM_PID"
+
+    # Wait for the port to actually close, not just for the signal to be sent.
+    local i
+    for i in $(seq 1 50); do
+        llm_serving || break
+        sleep 0.2
+    done
+
+    if llm_serving; then
+        echo "  SIGTERM was not enough; escalating to SIGKILL" >&2
+        pids="$(pgrep -x ollama 2>/dev/null | tr '\n' ' ')"
+        if [ -n "$pids" ]; then
+            # shellcheck disable=SC2086
+            kill -9 $pids 2>/dev/null
+        fi
+        for i in $(seq 1 25); do
+            llm_serving || break
+            sleep 0.2
+        done
+    fi
+
+    llm_serving && echo "llm: warning: still answering on $LLM_PORT" >&2
+
+    # Report the release rather than assume it.
+    local mem; mem="$(llm_gpu_mem)"
+    [ -n "${mem:-}" ] && echo "  GPU memory in use: ${mem}"
     return 0
+}
+
+do_status() {
+    printf '  ollama:   '
+    if [ -x "$OLLAMA_BIN" ]; then
+        "$OLLAMA_BIN" --version 2>/dev/null | head -1 || echo "present"
+    else
+        echo "NOT INSTALLED"
+    fi
+
+    printf '  server:   '
+    if llm_serving; then echo "ON   $(llm_url)"; else echo "OFF  (start with: llm on)"; fi
+
+    printf '  model:    %s' "$LLM_MODEL"
+    local loaded; loaded="$(llm_loaded_model)"
+    if [ -n "$loaded" ]; then
+        printf '   loaded\n'
+        printf '  processor: %s\n' "$(llm_processor)"
+    else
+        printf '   not loaded\n'
+    fi
+
+    printf '  context:  %s\n' "$LLM_CTX"
+    local mem; mem="$(llm_gpu_mem)"
+    [ -n "${mem:-}" ] && printf '  gpu mem:  %s\n' "$mem"
+
+    if [ -x "$OLLAMA_BIN" ]; then
+        printf '  installed:\n'
+        ollama_cli list 2>/dev/null | tail -n +2 | awk 'NF {printf "    %-26s %-10s %s\n", $1, $3" "$4, $5" "$6}' | head -10
+    fi
+}
+
+do_models() {
+    require_ollama
+    ollama_cli list
+}
+
+do_pull() {
+    require_ollama
+    local tag="${1:-$LLM_MODEL}"
+    echo "  pulling $tag (this can be several GB)"
+    ollama_cli pull "$tag"
 }
 
 # Print the header comment block only, minus the leading "# ".
@@ -152,14 +203,16 @@ cmd="${1:-status}"
 [ $# -gt 0 ] && shift
 
 case "$cmd" in
-    on|start|up)   do_on "${1:-q6}" "${2:-$LLM_PORT}" ;;
-    off|stop|down) do_off ;;
-    toggle)        if is_running; then do_off; else do_on "${1:-q6}" "${2:-$LLM_PORT}"; fi ;;
-    restart)       do_off && do_on "${1:-q6}" "${2:-$LLM_PORT}" ;;
-    status|"")     do_status ;;
-    log)           preset="$(current_preset)"; [ -n "${preset:-}" ] && [ "$preset" != "?" ] || preset=q6
-                   exec tail -f "$LLM_LOGS/${preset}-p${LLM_PORT}.log" ;;
-    watch|attach)  exec tmux attach -t "$LLM_SESSION" ;;
+    on|start|up)    do_on ;;
+    off|stop|down)  do_off ;;
+    toggle)         if llm_serving; then do_off; else do_on; fi ;;
+    restart)        do_off && do_on ;;
+    status|"")      do_status ;;
+    models|list)    do_models ;;
+    pull)           do_pull "${1:-}" ;;
+    log|watch|attach)
+        [ -f "$LLM_LOG" ] || die "no log at $LLM_LOG yet"
+        exec tail -n 50 -f "$LLM_LOG" ;;
     help|-h|--help) usage ;;
-    *)             die "unknown command '$cmd' (try: llm help)" ;;
+    *)              die "unknown command '$cmd' (try: llm help)" ;;
 esac

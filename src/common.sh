@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Shared configuration and helpers. Sourced by every other script.
-# Not executable on purpose — source it, don't run it.
+# Shared configuration and helpers for the Ollama-backed LLM server.
+# Sourced by every other script. Not executable on purpose — source it.
 #
-# Every setting can be overridden by exporting it before the script runs, and
-# persistently by creating $LLM_DIR/config.env (see config.env.example). The
-# order is: built-in default -> config.env -> environment.
+# Every setting can be overridden by exporting it, and persistently by creating
+# $LLM_DIR/config.env. Precedence: default -> config.env -> environment.
+#
+# This replaced a llama.cpp + Vulkan build. Ollama vendors the same ggml Vulkan
+# backend, so the GPU story is unchanged; what changed is that the runtime is a
+# server you drive by model name rather than a binary you launch against a file.
 
 LLM_DIR="${LLM_DIR:-$HOME/llm}"
 
@@ -14,15 +17,19 @@ if [ -f "$LLM_DIR/config.env" ]; then
     . "$LLM_DIR/config.env"
 fi
 
-LLM_BIN="${LLM_BIN:-$LLM_DIR/llama}"
-LLM_MODELS="${LLM_MODELS:-$LLM_DIR/models}"
-LLM_LOGS="${LLM_LOGS:-$LLM_DIR/logs}"
+# ---------------------------------------------------------------- the model --
+# An Ollama tag, not a file path. `ollama list` shows what is present.
+: "${LLM_MODEL:=qwen3.5:9b}"
+
+# --------------------------------------------------------------- the runtime --
+# Ollama's binary. The installer drops it in ~/.local/bin so no sudo is needed
+# and, deliberately, no systemd service exists to start on boot.
+: "${OLLAMA_BIN:=$HOME/.local/bin/ollama}"
+: "${OLLAMA_MODELS_DIR:=$HOME/.ollama/models}"
 
 # Pick a routable LAN address, preferring the interface with a default route.
 # Prints 127.0.0.1 if it cannot work one out, which is a safe default: it means
 # "loopback only" rather than "accidentally world reachable".
-#
-# Defined before it is called below, because this file executes top to bottom.
 llm_detect_host() {
     local ip=""
     if command -v ip >/dev/null 2>&1; then
@@ -39,79 +46,121 @@ llm_detect_host() {
     printf '%s' "${ip:-127.0.0.1}"
 }
 
-# Where to bind. 0.0.0.0 would expose this to anything that can route to the
-# host, so the default is a detected LAN address and the documented fallback is
-# 127.0.0.1 (tunnel-only). There is no API key: see the security note in README.
-LLM_HOST="${LLM_HOST:-$(llm_detect_host)}"
-LLM_PORT="${LLM_PORT:-8080}"
-
-# Context length. KV cache costs roughly 17 MiB per 1024 tokens for Qwen3.5-9B at
-# q8_0, and it does not slow decode — it only costs prefill time on very long
-# prompts. Verified to load at 16384 (272 MiB) / 24576 (408 MiB) / 32768 (544 MiB)
-# on an RX 6600; 32768 is the ceiling there, not a preference.
+# Where the server binds, and where clients look for it.
 #
-# 32768 is the default because agentic clients need it. OpenCode's own system
-# prompt plus its tool definitions measure 6619 tokens, sent on every request
-# before you type anything. At 16384 with a typical 4096-token output reserve,
-# that leaves under 2000 tokens of real conversation and it starts compacting
-# almost immediately. Drop to 16384 only if you are calling this from plain
-# scripts and do not want the KV reservation. On a card with less than 8 GB,
-# start at 16384.
+# 127.0.0.1 by default, for two reasons. The Ollama CLI talks to 127.0.0.1:11434
+# unless told otherwise, so binding elsewhere makes `ollama list` print a
+# spurious "could not connect" warning. And this server has no API key, so the
+# safe default is that only this machine can reach it.
 #
-# Do NOT size this against the VRAM counter. amdgpu backs the model with either
-# VRAM or GTT and migrates between them at runtime, so mem_info_vram_used is not
-# a usable capacity signal on at least some drivers. See README.
-LLM_CTX="${LLM_CTX:-32768}"
-LLM_THREADS="${LLM_THREADS:-$(nproc 2>/dev/null || echo 4)}"
-LLM_NGL="${LLM_NGL:-99}"
+# To serve other machines, set LLM_HOST=0.0.0.0 (everything that can route here)
+# or the LAN address, and remember there is no authentication.
+: "${LLM_HOST:=127.0.0.1}"
+: "${LLM_PORT:=11434}"
 
-# Group that owns /dev/dri/renderD*. Usually "render", sometimes "video".
-LLM_RENDER_GROUP_NAME="${LLM_RENDER_GROUP_NAME:-render}"
-LLM_SESSION="${LLM_SESSION:-llm}"
+# ---------------------------------------------------------------- behaviour --
+# Context window. THE setting to get right on migration: Ollama's own default is
+# 4096, and an agentic client's system prompt plus tool definitions alone run
+# ~6.6k tokens. At 4096 that truncates silently — the failure looks like the
+# model ignoring instructions, not like a configuration error.
+: "${LLM_CTX:=32768}"
 
-llm_model_path() {
-    case "$1" in
-        q6|Q6) echo "$LLM_MODELS/Qwen3.5-9B-Q6_K.gguf" ;;
-        q4|Q4) echo "$LLM_MODELS/Qwen3.5-9B-Q4_K_M.gguf" ;;
-        *) return 1 ;;
-    esac
+# How long a model stays resident in VRAM after the last request.
+: "${LLM_KEEP_ALIVE:=5m}"
+
+# --------------------------------------------------------------------- paths --
+LLM_LOGS="${LLM_LOGS:-$LLM_DIR/logs}"
+LLM_PID="$LLM_LOGS/ollama.pid"
+LLM_LOG="$LLM_LOGS/ollama.log"
+
+llm_url() { printf 'http://%s:%s' "$LLM_HOST" "$LLM_PORT"; }
+
+# The base URL to actually talk to.
+#
+# Normally this is the configured host. But a server can be bound to loopback
+# while the config says otherwise — started by hand, or by a different tool.
+# Reporting "OFF" for a server that is answering would be a lie, so fall back to
+# 127.0.0.1 before giving up.
+llm_base() {
+    if curl -sS -o /dev/null --max-time 2 "$(llm_url)/api/version" 2>/dev/null; then
+        printf '%s' "$(llm_url)"
+    else
+        printf 'http://127.0.0.1:%s' "$LLM_PORT"
+    fi
 }
 
-# Can this process open the render node right now?
-llm_render_ok() {
-    python3 - <<'PY' 2>/dev/null
-import glob, os, sys
-nodes = sorted(glob.glob("/dev/dri/renderD*"))
-if not nodes:
-    sys.exit(1)
+# Is the server answering? Ask over HTTP rather than checking for a process:
+# `ollama` is also the CLI name, so pgrep matches short-lived client runs too.
+llm_serving() {
+    curl -sS -o /dev/null --max-time 3 "$(llm_base)/api/version" 2>/dev/null
+}
+
+# The resolved base as host:port, for OLLAMA_HOST.
+llm_hostport() {
+    local base; base="$(llm_base)"
+    printf '%s' "${base#http://}"
+}
+
+# Run the ollama CLI against the server we manage. Without OLLAMA_HOST the CLI
+# talks to its own default and prints "could not connect to a running Ollama
+# instance" whenever the server is bound anywhere else — a confusing warning
+# for a server that is up.
+ollama_cli() {
+    OLLAMA_HOST="$(llm_hostport)" "$OLLAMA_BIN" "$@"
+}
+
+# Which model is resident right now, per the server itself. Empty if none.
+llm_loaded_model() {
+    curl -sS --max-time 5 "$(llm_base)/api/ps" 2>/dev/null | python3 -c '
+import json, sys
 try:
-    fd = os.open(nodes[0], os.O_RDWR)
-    os.close(fd)
-except OSError:
-    sys.exit(1)
-PY
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for m in d.get("models", []):
+    print(m.get("name") or m.get("model") or "")
+    break
+' 2>/dev/null
 }
 
-# The first DRM card that exposes amdgpu-style memory counters. Prints nothing
-# if none does (e.g. an iGPU with a different driver), so callers must handle
-# the empty case rather than assuming card0 exists.
+# Where the resident model lives: "100% GPU", "41%/59% CPU/GPU", or empty.
+llm_processor() {
+    curl -sS --max-time 5 "$(llm_base)/api/ps" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for m in d.get("models", []):
+    size = m.get("size") or 0
+    vram = m.get("size_vram") or 0
+    if not size:
+        continue
+    pct = round(100 * vram / size)
+    print("100% GPU" if pct >= 99 else f"{pct}% GPU, {100 - pct}% CPU")
+    break
+' 2>/dev/null
+}
+
+# The DRM device directory that exposes memory counters, if there is one.
 llm_drm_device_dir() {
     local d
     for d in /sys/class/drm/card*/device; do
-        [ -r "$d/mem_info_vram_used" ] && { echo "$d"; return 0; }
-    done
-    for d in /sys/class/drm/card*/device; do
-        [ -d "$d" ] && { echo "$d"; return 0; }
+        [ -r "$d/mem_info_vram_used" ] && { printf '%s' "$d"; return 0; }
     done
     return 1
 }
 
-# Run a command with the render group active, preserving argv. `llm-run` is a
-# separate script rather than a function because newgrp(1) re-execs its command
-# with an empty argv — see the comments in llm-run for the full story.
+# GPU memory in MB, as "vram gtt".
 #
-# This one does NOT replace the current process, so it is safe to call in the
-# middle of a script. Use llm_with_render_group only as the final statement.
-llm_run() { "$LLM_DIR/llm-run" "$@"; }
-
-llm_with_render_group() { exec "$LLM_DIR/llm-run" "$@"; }
+# Both, not just VRAM. On this card the driver puts model allocations in GTT
+# (system RAM the GPU can address) and leaves dedicated VRAM nearly empty, so a
+# lone "vram: 16 MB" line reads as "nothing is loaded" while 6 GB is in use.
+# The previous llama.cpp build printed both for the same reason.
+llm_gpu_mem() {
+    local d vram gtt
+    d="$(llm_drm_device_dir)" || return 1
+    vram="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_vram_used" 2>/dev/null)"
+    gtt="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_gtt_used" 2>/dev/null)"
+    printf 'vram %s MB, gtt %s MB' "${vram:-?}" "${gtt:-?}"
+}

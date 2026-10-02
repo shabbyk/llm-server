@@ -249,6 +249,10 @@ TTS_THREADS=6
 
 ## Building
 
+Most people should not do this by hand — `./install.sh` at the repository root
+installs the toolchain, builds this, and fetches the engine and weights. The
+notes below are for doing it yourself or debugging that.
+
 Requires a Rust toolchain and a C toolchain. If `cargo build` fails with
 ``linker `cc` not found``, the C toolchain is missing:
 

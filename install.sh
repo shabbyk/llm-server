@@ -1,418 +1,372 @@
 #!/usr/bin/env bash
-# Install a local llama.cpp LLM server (Vulkan) plus an on/off switch.
+# Interactive installer for the local AI stack.
 #
-#   ./install.sh                     # interactive: deps, binaries, both models
-#   ./install.sh --skip-models       # just the plumbing, fetch models later
-#   ./install.sh --models q6         # only the default model (7.5 GB)
-#   ./install.sh --dir ~/.local/llm  # install somewhere else
-#   ./install.sh --uninstall
+#   ./install.sh              # asks what you want, then installs it
+#   ./install.sh --yes        # install everything, no questions
+#   ./install.sh --llm-only
+#   ./install.sh --tts-only
+#   ./install.sh --force      # reinstall things that are already present
 #
-# Nothing is started automatically and nothing is registered as a service. You
-# get a switch: `llm on` / `llm off`.
+# Two independent pieces:
+#
+#   LLM   Ollama running qwen3.5:9b, exposed as an OpenAI-compatible API.
+#         Installed user-locally: no sudo, and deliberately NO systemd unit, so
+#         nothing starts on boot. Drive it with `llm on` / `llm off`.
+#
+#   TTS   The Rust wrapper in tts/ plus the KoboldCpp engine and Qwen3-TTS
+#         weights, for text-to-speech with zero-shot voice cloning.
+#         Drive it with `tts on` / `tts off`.
+#
+# Debian and Ubuntu are supported. Anything else is refused rather than
+# half-attempted, because the package names and the Vulkan setup differ.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ---------------------------------------------------------------- defaults --
-LLM_BUILD="${LLM_BUILD:-b11146}"       # llama.cpp release tag; "latest" works
-LLM_REPO="${LLM_REPO:-unsloth/Qwen3.5-9B-GGUF}"
-LLM_MODELS_WANTED="q6 q4"
-SKIP_DEPS=0
-SKIP_MODELS=0
-ASSUME_YES=0
-UNINSTALL=0
-
-# ------------------------------------------------------------------ output --
-if [ -t 1 ]; then
-    B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
-else
-    B=""; G=""; Y=""; R=""; D=""; N=""
-fi
-step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
-info() { printf '    %s\n' "$*"; }
-warn() { printf '%s    warning:%s %s\n' "$Y" "$N" "$*"; }
-die()  { printf '%s    error:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
-ok()   { printf '%s    ok%s %s\n' "$G" "$N" "$*"; }
-
-# ------------------------------------------------- invoking user's home ----
-# This installer is meant to run as the person who will use it; it elevates
-# internally for apt and group membership only. Started as `sudo ./install.sh`
-# it inherits $HOME=/root, and then models, binaries, ~/.local/bin/llm and the
-# .bashrc edit all land in root's home instead of the caller's. So anchor
-# everything on the account that actually typed the command.
-INVOKER_USER="$(id -un)"
-if [ "$(id -u)" -eq 0 ]; then
-    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-        INVOKER_USER="$SUDO_USER"
-    else
-        die "refusing to run as root with no invoking user: \$HOME is $HOME, so the install
-  would land in root's home. Run it as yourself -- it calls sudo internally for
-  packages and group membership. To install as root on purpose, pass --dir explicitly."
-    fi
-fi
-INVOKER_HOME="$(getent passwd "$INVOKER_USER" | cut -d: -f6)"
-[ -n "$INVOKER_HOME" ] || die "cannot resolve the home directory of '$INVOKER_USER'"
-
-# Downstream steps write to $HOME (the switch symlink, .bashrc) and to
-# $LLM_DIR; keep both pointed at the human, not at the apt-capable account.
-HOME="$INVOKER_HOME"
-export HOME
+OLLAMA_VERSION="${OLLAMA_VERSION:-latest}"
 LLM_DIR="${LLM_DIR:-$HOME/llm}"
+TTS_DIR="${TTS_DIR:-$HOME/tts}"
+BINDIR="${BINDIR:-$HOME/.local/bin}"
 
-usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; }
+KOBOLDC_VER="${KOBOLDC_VER:-v1.122.1}"
+# The nocuda build is 137 MB against 642 MB for the CUDA one, and it is the
+# variant that actually ships the Vulkan backend used on AMD. Confirmed working
+# on an RX 6600.
+KOBOLDC_ASSET="koboldcpp-linux-x64-nocuda"
+TTS_REPO="https://huggingface.co/koboldcpp/tts/resolve/main"
+TTS_MODELS=(
+    "Qwen3-TTS-12Hz-1.7B-Base-q8_0.gguf"
+    "qwen3-tts-tokenizer-q8_0.gguf"
+)
 
-# -------------------------------------------------------------------- args --
+WANT_LLM="" ; WANT_TTS="" ; ASSUME_YES=0 ; FORCE=0
+
+# Share the config and helpers with the switch, so the installer and `llm`
+# cannot drift apart on model name, port, or how the CLI is invoked.
+# shellcheck disable=SC1091
+. "$REPO_DIR/src/common.sh"
+
+B=$'\033[1m'; N=$'\033[0m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'
+step() { printf '\n%s==>%s %s\n' "$B" "$N" "$*"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '    %s%s%s %s\n' "$G" "$*" "$N" ""; }
+warn() { printf '    %swarning:%s %s\n' "$Y" "$N" "$*"; }
+die()  { printf '    %serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+ask_yn() { # prompt default(y/n)
+    local prompt="$1" default="${2:-y}" reply
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        printf '  %s [auto: yes]\n' "$prompt"
+        return 0
+    fi
+    if [ "$default" = "y" ]; then
+        printf '  %s [Y/n] ' "$prompt"
+    else
+        printf '  %s [y/N] ' "$prompt"
+    fi
+    read -r reply || reply=""
+    reply="${reply:-$default}"
+    case "$reply" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dir)          LLM_DIR="$2"; shift 2 ;;
-        --build)        LLM_BUILD="$2"; shift 2 ;;
-        --repo)         LLM_REPO="$2"; shift 2 ;;
-        --models)       LLM_MODELS_WANTED="$2"; shift 2 ;;
-        --skip-deps)    SKIP_DEPS=1; shift ;;
-        --skip-models)  SKIP_MODELS=1; shift ;;
-        -y|--yes)       ASSUME_YES=1; shift ;;
-        --uninstall)    UNINSTALL=1; shift ;;
-        -h|--help)      usage; exit 0 ;;
-        *)              die "unknown option '$1' (try --help)" ;;
+        --yes|-y)    ASSUME_YES=1 ;;
+        --llm-only)  WANT_LLM=1; WANT_TTS=0 ;;
+        --tts-only)  WANT_LLM=0; WANT_TTS=1 ;;
+        --force)     FORCE=1 ;;
+        -h|--help)   sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; exit 0 ;;
+        *)           die "unknown option: $1 (try --help)" ;;
     esac
+    shift
 done
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64|amd64)  ARCH_TAG="x64" ;;
-    aarch64|arm64) ARCH_TAG="arm64" ;;
-    *) die "unsupported architecture '$ARCH'. This installer ships prebuilt Vulkan binaries for x64 and arm64 only; building from source is a separate job." ;;
+# ---------------------------------------------------------------- platform --
+. /etc/os-release 2>/dev/null || die "cannot read /etc/os-release"
+case "${ID:-} ${ID_LIKE:-}" in
+    *debian*|*ubuntu*) ;;
+    *) die "unsupported distribution '${ID:-unknown}'. This installer supports Debian and Ubuntu." ;;
 esac
+[ "$(uname -m)" = "x86_64" ] || die "unsupported architecture '$(uname -m)'; x86_64 only."
 
-# --------------------------------------------------------------- uninstall --
-if [ "$UNINSTALL" -eq 1 ]; then
-    step "Uninstalling"
-    if pgrep -x llama-server >/dev/null 2>&1; then
-        "$LLM_DIR/stop.sh" 2>/dev/null || kill $(pgrep -x llama-server) 2>/dev/null || true
-    fi
-    tmux kill-session -t llm 2>/dev/null && info "closed tmux session" || true
-    rm -f "$HOME/.local/bin/llm"
-    info "removed ~/.local/bin/llm"
-    if [ -d "$LLM_DIR" ]; then
-        printf '    %sDelete %s and all downloaded models (~13 GB)? [y/N] ' "$Y" "$LLM_DIR"
-        read -r reply </dev/tty || reply=""
-        if [ "${reply,,}" = y ]; then
-            rm -rf "$LLM_DIR"
-            info "deleted $LLM_DIR"
-        else
-            info "kept $LLM_DIR (delete it by hand to finish)"
-        fi
-    fi
-    # Group membership is deliberately left alone: removing it is a system-wide
-    # change that other software on the box may depend on.
-    warn "group membership (video/render) left as-is; remove by hand with 'sudo gpasswd -d $INVOKER_USER render' if you are sure"
-    step "Done."
-    exit 0
-fi
-
-# ------------------------------------------------------------- preflight ---
-step "Preflight"
-if [ ! -r /etc/os-release ]; then
-    die "cannot identify the OS (/etc/os-release missing)"
-fi
-# shellcheck disable=SC1091
-. /etc/os-release
-info "os         $PRETTY_NAME"
-info "arch       $ARCH (using $ARCH_TAG builds)"
-info "install to $LLM_DIR"
-
-[ "$LLM_BUILD" = "latest" ] || [ -n "$LLM_BUILD" ] || die "LLM_BUILD must be a tag or 'latest'"
-[ -w "$(dirname "$LLM_DIR")" ] || die "cannot write to $(dirname "$LLM_DIR") (set --dir, or fix permissions)"
-ok "preflight passed"
-
-# Ask before doing anything that needs sudo, rather than failing halfway in.
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        SUDO="sudo"
-    else
-        die "this install needs root for package installation and group membership, and sudo is not available. Re-run as root, or use --skip-deps and add the groups by hand."
-    fi
+    command -v sudo >/dev/null 2>&1 || die "sudo is required to install packages"
+    SUDO="sudo"
 fi
 
-# ------------------------------------------------------------------ deps ---
-if [ "$SKIP_DEPS" -eq 0 ]; then
-    step "System packages"
-    if [ -z "$SUDO" ]; then
-        info "already root"
-    elif [ "$ASSUME_YES" -eq 1 ]; then
-        $SUDO -n true 2>/dev/null || die "need sudo but -n failed; re-run without --yes so you can authenticate"
+apt_install() {
+    info "apt-get install $*"
+    $SUDO apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq --no-install-recommends "$@"
+}
+
+need_pkg() { # command package...
+    local cmd="$1" pkg="$2"
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    apt_install "$pkg"
+}
+
+printf '%s\n' "  ${B}Local AI stack installer${N}"
+printf '  %s\n' "$PRETTY_NAME"
+printf '  repo: %s\n' "$REPO_DIR"
+
+# ------------------------------------------------------------------- LLM ----
+install_ollama() {
+    step "Ollama (LLM runtime)"
+
+    mkdir -p "$BINDIR" "$LLM_DIR/logs"
+
+    if [ -x "$BINDIR/ollama" ] && [ "$FORCE" -ne 1 ]; then
+        ok "already installed: $("$BINDIR/ollama" --version 2>/dev/null | head -1 || echo present)"
+        return 0
     fi
 
-    # libgomp1 is not optional and is easy to miss: without it llama-server dies
-    # at startup with "libgomp.so.1 => not found" and no useful error.
-    #
-    # The Vulkan driver package name is Mesa-specific. On NVIDIA you need the
-    # proprietary ICD instead, which this script does not attempt to install.
-    PKGS="curl tmux python3 libgomp1 libvulkan1 vulkan-tools"
-    FW_PKGS=""
-    if [ "$ID" = "ubuntu" ]; then
-        PKGS="$PKGS mesa-vulkan-drivers"
-    elif [ "$ID" = "debian" ]; then
-        PKGS="$PKGS mesa-vulkan-drivers"
-        # Debian keeps the amdgpu blobs in their own package rather than inside
-        # linux-firmware, and it sits in non-free-firmware, so a stock
-        # sources.list does not have it. A Navi 2 card (RX 6600) needs the
-        # gc_11_0_3 blobs from it. Best-effort, so a missing component does not
-        # abort an otherwise fine install.
-        FW_PKGS="firmware-amd-graphics"
-    elif [ "$ID" = "fedora" ]; then
-        PKGS="$PKGS vulkan-loader vulkan-tools mesa-vulkan-drivers"
-    elif [ "$ID" = "arch" ]; then
-        PKGS="$PKGS vulkan-icd-loader vulkan-tools mesa-vulkan-drivers"
+    need_pkg curl curl
+    need_pkg tar tar
+    need_pkg zstd zstd
+    need_pkg python3 python3
+
+    local url tag
+    if [ "$OLLAMA_VERSION" = "latest" ]; then
+        tag="$(curl -fsSL https://api.github.com/repos/ollama/ollama/releases/latest \
+               | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
     else
-        warn "unrecognised distro '$ID'; not adding a Vulkan driver package"
+        tag="$OLLAMA_VERSION"
     fi
+    url="https://github.com/ollama/ollama/releases/download/${tag}/ollama-linux-amd64.tar.zst"
 
-    info "installing: $PKGS"
-    # shellcheck disable=SC2086
-    $SUDO apt-get update -qq 2>/dev/null || $SUDO dnf -y -q install 2>/dev/null || \
-        $SUDO pacman -Sy --noconfirm 2>/dev/null || warn "could not refresh package lists; continuing"
-    # shellcheck disable=SC2086
-    $SUDO apt-get install -y -qq $PKGS 2>/dev/null \
-        || $SUDO dnf -y -q install $PKGS 2>/dev/null \
-        || $SUDO pacman -S --noconfirm --needed $PKGS 2>/dev/null \
-        || die "package installation failed. Install these by hand: $PKGS"
-    ok "packages present"
+    info "downloading $tag (about 1.4 GB)"
+    curl -fL --retry 3 --retry-delay 3 -o /tmp/ollama.tar.zst "$url"
 
-    if [ -n "$FW_PKGS" ]; then
-        # shellcheck disable=SC2086
-        if $SUDO apt-get install -y -qq $FW_PKGS 2>/dev/null; then
-            ok "$FW_PKGS"
-        else
-            warn "could not install $FW_PKGS."
-            warn "on Debian it lives in non-free-firmware. Without those blobs an"
-            warn "RX 6000-series card can fail to initialise or lose acceleration."
-        fi
+    info "extracting to $HOME/.local"
+    tar --zstd -xf /tmp/ollama.tar.zst -C "$HOME/.local"
+    rm -f /tmp/ollama.tar.zst
+
+    [ -x "$BINDIR/ollama" ] || die "expected $BINDIR/ollama after extraction"
+    ok "installed $("$BINDIR/ollama" --version 2>/dev/null | head -1)"
+
+    # Note carefully what is NOT done here: no systemd unit, no /etc, no root.
+    info "no systemd unit created — nothing will start on boot"
+}
+
+start_ollama() {
+    command -v pgrep >/dev/null 2>&1 || need_pkg pgrep procps
+    if curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:11434/api/version" 2>/dev/null; then
+        return 0
     fi
-else
-    step "System packages"
-    info "skipped (--skip-deps)"
-fi
-
-# ------------------------------------------------------------- GPU gate ----
-step "GPU check"
-if ! command -v vulkaninfo >/dev/null 2>&1; then
-    warn "vulkaninfo not found; cannot verify the GPU. Continuing, but if the server reports no device, this is why."
-else
-    # A CPU fallback (llvmpipe/lavapipe) will happily appear here, so require a
-    # real hardware device. Filter out the software rasterisers explicitly.
-    VULKAN_OUT="$(vulkaninfo --summary 2>/dev/null || true)"
-    HW="$(printf '%s\n' "$VULKAN_OUT" | grep -E 'deviceName|deviceType' \
-          | grep -viE 'llvmpipe|lavapipe|swiftshader|software' || true)"
-    if [ -z "$HW" ]; then
-        warn "no hardware Vulkan device found. Drivers may be missing or you may lack access to /dev/dri."
-        warn "the install will continue, but the server will not offload to the GPU."
-    else
-        printf '%s\n' "$VULKAN_OUT" | sed -n 's/^ *deviceName *= */    /p' | head -3
-        ok "hardware Vulkan device present"
-    fi
-fi
-
-if [ -e /dev/dri/renderD128 ] || ls /dev/dri/renderD* >/dev/null 2>&1; then
-    GRP=""
-    for g in render video; do
-        if getent group "$g" >/dev/null 2>&1; then GRP="$g"; break; fi
+    OLLAMA_HOST="127.0.0.1:11434" OLLAMA_KEEP_ALIVE=5m \
+        setsid "$BINDIR/ollama" serve >>"$LLM_DIR/logs/ollama.log" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+    local i
+    for i in $(seq 1 30); do
+        curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:11434/api/version" 2>/dev/null && return 0
+        sleep 1
     done
-    if [ -z "$GRP" ]; then
-        warn "no 'render' or 'video' group on this system; cannot check GPU access"
-    elif id -nG | tr ' ' '\n' | grep -qx "$GRP"; then
-        ok "already in group '$GRP'"
+    return 1
+}
+
+pull_model() {
+    local model="${LLM_MODEL:-qwen3.5:9b}"
+    step "Model: $model"
+
+    start_ollama || die "the Ollama server did not start; see $LLM_DIR/logs/ollama.log"
+
+    # `ollama list` prints names with an explicit tag, so a model created from a
+    # GGUF shows up as "myname:latest" while the request says "myname". Match
+    # both forms, or every local model looks missing and gets re-pulled.
+    if ollama_cli list 2>/dev/null | awk 'NR>1 {print $1}' \
+        | grep -qxE "${model}(:latest)?$"; then
+        ok "already pulled: $model"
+        return 0
+    fi
+
+    info "pulling $model — this can be several GB"
+    if ! ollama_cli pull "$model"; then
+        die "could not pull '$model'. Check the tag at https://ollama.com/library"
+    fi
+    ok "pulled $model"
+}
+
+verify_llm() {
+    step "Verifying the LLM"
+    local model="${LLM_MODEL:-qwen3.5:9b}"
+
+    # Load it and see where it actually landed. A silent CPU fallback is the
+    # failure this check exists to catch: it looks like a slow model, not an
+    # error, so it needs to be stated explicitly.
+    curl -sS --max-time 600 "http://127.0.0.1:11434/api/generate" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$model\",\"prompt\":\"\",\"keep_alive\":\"5m\"}" -o /dev/null || true
+
+    local proc
+    proc="$(curl -sS --max-time 5 http://127.0.0.1:11434/api/ps 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for m in d.get("models", []):
+    s=m.get("size") or 0; v=m.get("size_vram") or 0
+    if s: print("100% GPU" if round(100*v/s)>=99 else f"{round(100*v/s)}% GPU"); break
+' 2>/dev/null)"
+
+    if [ "$proc" = "100% GPU" ]; then
+        ok "loaded 100% on the GPU"
+    elif [ -n "$proc" ]; then
+        warn "loaded $proc — not fully on the GPU. A CPU load still 'works', just slowly."
+        warn "Check the Vulkan driver, and that you are in the 'render' group (id | grep render)."
     else
-        if [ "$SKIP_DEPS" -eq 0 ] && [ -n "$SUDO" ]; then
-            $SUDO usermod -aG "$GRP" "$INVOKER_USER" 2>/dev/null || warn "could not add you to '$GRP'"
-            ok "added you to '$GRP' — takes effect at your next login"
-        else
-            warn "not in group '$GRP'. Run: sudo usermod -aG $GRP $INVOKER_USER"
-        fi
-        warn "until you log out and back in, the llm-run shim bridges this by re-execing under 'newgrp'"
+        warn "could not determine where the model loaded"
     fi
-else
-    warn "no /dev/dri/renderD* — this machine appears to have no GPU, or no display driver bound"
-fi
+}
 
-# ------------------------------------------------------------- binaries ----
-step "llama.cpp binaries ($LLM_BUILD, Vulkan)"
+# ------------------------------------------------------------------- TTS ----
+install_tts() {
+    step "TTS engine and weights"
+    mkdir -p "$TTS_DIR"/{bin,models,voices,logs,out}
 
-if [ "$LLM_BUILD" = "latest" ]; then
-    LLM_BUILD="$(curl -fsSL --max-time 30 "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" 2>/dev/null \
-                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || true)"
-    [ -n "$LLM_BUILD" ] || die "could not determine the latest llama.cpp release; pass --build <tag>"
-    info "latest release is $LLM_BUILD"
-fi
-
-BIN_DIR="$LLM_DIR/llama"
-TARBALL="llama-${LLM_BUILD}-bin-ubuntu-vulkan-${ARCH_TAG}.tar.gz"
-URL="https://github.com/ggml-org/llama.cpp/releases/download/${LLM_BUILD}/${TARBALL}"
-
-if [ -x "$BIN_DIR/llama-server" ]; then
-    # llama-server writes its version banner to stderr, not stdout, so capture
-    # both streams or `have` comes back empty. Extract the build number rather
-    # than the whole line: the banner is preceded by a timestamped log line, and
-    # a plain ${have##*build } would also drag along ", commit 7fe450e19)".
-    have="$("$BIN_DIR/llama-server" --version 2>&1 \
-            | sed -n 's/.*[^0-9]build \([0-9]\{1,\}\).*/\1/p' | head -1)"
-    info "already installed: build ${have:-unknown} (want $LLM_BUILD)"
-    # Only complain when a number was actually read: an unreadable banner is not
-    # evidence of a mismatch, and warning here invites deleting a working install.
-    if [ -n "$have" ] && [ "$have" != "${LLM_BUILD#b}" ] && [ "$have" != "$LLM_BUILD" ]; then
-        warn "that is a different build than $LLM_BUILD; delete $BIN_DIR to change it"
-    fi
-    ok "binaries present"
-else
-    info "downloading $TARBALL"
-    tmp="$(mktemp -d)"
-    # -C - makes this resumable if a previous attempt died partway.
-    if curl -fL --retry 5 --retry-delay 3 -C - -o "$tmp/$TARBALL" "$URL"; then
-        mkdir -p "$LLM_DIR"
-        tar -xzf "$tmp/$TARBALL" -C "$tmp"
-        found="$(find "$tmp" -maxdepth 2 -name llama-server -type f | head -1)"
-        [ -n "$found" ] || die "tarball did not contain llama-server"
-        rm -rf "$BIN_DIR"
-        mv "$(dirname "$found")" "$BIN_DIR"
-        rm -rf "$tmp"
-        ok "installed to $BIN_DIR"
+    # --- the engine ---------------------------------------------------------
+    if [ -x "$TTS_DIR/bin/koboldcpp" ] && [ "$FORCE" -ne 1 ]; then
+        ok "already present: $TTS_DIR/bin/koboldcpp"
     else
-        rm -rf "$tmp"
-        die "download failed: $URL
-  If the tag does not exist, pick another with --build <tag>, or use --build latest."
+        need_pkg curl curl
+        local url="https://github.com/LostRuins/koboldcpp/releases/download/${KOBOLDC_VER}/${KOBOLDC_ASSET}"
+        info "downloading KoboldCpp ${KOBOLDC_VER} (~137 MB, the Vulkan build)"
+        curl -fL --retry 3 --retry-delay 3 -o "$TTS_DIR/bin/koboldcpp" "$url"
+        chmod +x "$TTS_DIR/bin/koboldcpp"
+        ok "installed $TTS_DIR/bin/koboldcpp"
     fi
-fi
 
-# A missing shared library here is the single most common way this silently
-# breaks, and the error only appears at runtime. Check now, while it is cheap.
-if command -v ldd >/dev/null 2>&1; then
-    missing="$(ldd "$BIN_DIR/llama-server" 2>/dev/null | grep -i 'not found' || true)"
-    if [ -n "$missing" ]; then
-        warn "llama-server has unresolved libraries:"
-        printf '%s\n' "$missing" | sed 's/^/      /'
-        warn "install the matching -dev/-runtime packages, then re-run. (libgomp.so.1 comes from libgomp1.)"
-    else
-        ok "all shared libraries resolve"
-    fi
-fi
-
-# --------------------------------------------------------------- models ----
-if [ "$SKIP_MODELS" -eq 0 ]; then
-    step "Models ($LLM_REPO)"
-    mkdir -p "$LLM_DIR/models"
-    for preset in $LLM_MODELS_WANTED; do
-        case "$preset" in
-            q6) fname="Qwen3.5-9B-Q6_K.gguf" ;;
-            q4) fname="Qwen3.5-9B-Q4_K_M.gguf" ;;
-            *) die "unknown preset '$preset' (expected q6 or q4)" ;;
-        esac
-        dest="$LLM_DIR/models/$fname"
-        if [ -f "$dest" ]; then
-            ok "$(basename "$dest") already downloaded ($(du -h "$dest" | cut -f1))"
+    # --- the weights --------------------------------------------------------
+    need_pkg curl curl
+    local f dest
+    for f in "${TTS_MODELS[@]}"; do
+        dest="$TTS_DIR/models/$f"
+        if [ -f "$dest" ] && [ "$FORCE" -ne 1 ]; then
+            ok "already present: $f"
             continue
         fi
-        url="https://huggingface.co/${LLM_REPO}/resolve/main/${fname}"
-        info "downloading $fname (~$(curl -fsSLI --max-time 20 "$url" 2>/dev/null \
-             | grep -i '^content-length' | tail -1 | tr -dc '0-9' | awk '{printf "%.1f GB", $1/1e9}') )"
-        # -C - resumes; --retry rides out flaky links.
-        curl -fL --retry 5 --retry-delay 3 -C - -o "$dest" "$url" \
-            || die "download failed: $url"
-        ok "$(basename "$dest") ($(du -h "$dest" | cut -f1))"
+        info "downloading $f"
+        curl -fL --retry 3 --retry-delay 3 -o "$dest" "$TTS_REPO/$f"
+        ok "installed $f ($(du -h "$dest" | cut -f1))"
     done
-else
-    step "Models"
-    info "skipped (--skip-models)"
-fi
+}
 
-# -------------------------------------------------------------- install ----
-step "Installing scripts"
-mkdir -p "$LLM_DIR/logs"
-for f in common.sh llm-run llm start.sh stop.sh status.sh up.sh down.sh ask.sh ask.py bench.sh; do
-    install -m 0755 "$REPO_DIR/src/$f" "$LLM_DIR/$f"
-done
-# common.sh is sourced, not executed; but 0755 keeps it usable when someone
-# runs it by accident without breaking anything.
-ok "scripts installed to $LLM_DIR"
+build_tts() {
+    step "Building the TTS wrapper"
 
-if [ -f "$REPO_DIR/config.env.example" ] && [ ! -f "$LLM_DIR/config.env" ]; then
-    install -m 0644 "$REPO_DIR/config.env.example" "$LLM_DIR/config.env"
-    info "wrote $LLM_DIR/config.env — edit it to change host, port, context"
-fi
-
-# ---------------------------------------------------------------- switch ---
-step "Installing the 'llm' switch"
-BINDIR="$HOME/.local/bin"
-mkdir -p "$BINDIR"
-ln -sfn "$LLM_DIR/llm" "$BINDIR/llm"
-ok "linked $BINDIR/llm"
-
-if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
-    printf '\n# user-local binaries (llm on/off switch)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.bashrc"
-    info "added ~/.local/bin to PATH in ~/.bashrc"
-fi
-case ":$PATH:" in
-    *":$BINDIR:"*) : ;;
-    *) warn "$BINDIR is not on your PATH yet. Either 'exec bash -l' or run ~/.local/bin/llm by full path." ;;
-esac
-
-# -------------------------------------------------------------- tts (Rust) --
-# The TTS wrapper is a single Rust binary. There is no install step beyond
-# building it: the runtime tree (models, the koboldcpp binary, voices) lives in
-# $HOME/tts and is created by the user, not copied from here.
-if [ -d "$REPO_DIR/tts" ]; then
-    step "TTS wrapper"
-    if command -v cargo >/dev/null 2>&1; then
-        if (cd "$REPO_DIR/tts" && cargo build --release) >/dev/null 2>&1; then
-            ln -sfn "$REPO_DIR/tts/target/release/tts" "$BINDIR/tts"
-            ok "built and linked $BINDIR/tts"
-        else
-            warn "cargo build failed — run it by hand to see why:"
-            warn "    cd $REPO_DIR/tts && cargo build --release"
-        fi
-    else
-        warn "cargo not found, skipping the TTS wrapper."
-        warn "Install Rust (https://rustup.rs), then:"
-        warn "    cd $REPO_DIR/tts && cargo build --release && ln -sfn \$PWD/target/release/tts $BINDIR/tts"
+    # Check the install location as well as PATH: ~/.cargo/bin is often absent
+    # from a non-login shell, and re-running rustup just to find a cargo that is
+    # already there wastes a minute and can upgrade the toolchain underneath you.
+    if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        info "installing Rust (user-local, no sudo)"
+        need_pkg curl curl
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal
+        ok "installed rustup"
     fi
-fi
+    # shellcheck disable=SC1091
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+    export PATH="$HOME/.cargo/bin:$PATH"
 
-# ---------------------------------------------------------------- verify ---
-step "Verifying"
-# The real check is whether a hardware device is visible from a process that
-# can open the render node. --list-devices is the cheapest honest test.
-if "$BIN_DIR/llama-server" --list-devices 2>/dev/null | grep -qiE 'Vulkan[0-9]'; then
-    ok "llama-server sees a Vulkan device"
-    "$BIN_DIR/llama-server" --list-devices 2>/dev/null | grep -E 'Vulkan[0-9]' | sed 's/^/      /'
-elif "$LLM_DIR/llm-run" "$BIN_DIR/llama-server" --list-devices 2>/dev/null | grep -qiE 'Vulkan[0-9]'; then
-    ok "llama-server sees a Vulkan device (via the render-group shim)"
-else
-    warn "llama-server does not see a Vulkan device right now."
-    warn "If you were just added to the render group, log out and back in, then re-run."
-    warn "Check 'ls -l /dev/dri/renderD*' and 'vulkaninfo --summary'."
-fi
+    # A C toolchain is required even though the program contains no C: Rust
+    # compiles proc-macro crates and build scripts for the host, and linking
+    # those needs cc plus glibc's dev files. Without it the build fails with
+    # "linker `cc` not found", which is not an obvious message.
+    command -v cc >/dev/null 2>&1 || {
+        info "installing a C toolchain (needed to link Rust build scripts)"
+        apt_install build-essential
+    }
 
-# --------------------------------------------------------------- summary ---
+    info "cargo build --release"
+    ( cd "$REPO_DIR/tts" && cargo build --release ) || die "the TTS build failed"
+
+    [ -x "$REPO_DIR/tts/target/release/tts" ] || die "no binary after the build"
+    ln -sfn "$REPO_DIR/tts/target/release/tts" "$BINDIR/tts"
+    ok "linked $BINDIR/tts"
+}
+
+install_tts_config() {
+    if [ ! -f "$TTS_DIR/config.env" ]; then
+        # The example is written as KEY=VALUE comments, so copy it and let the
+        # defaults stand. Editing is optional.
+        sed -e 's/^#: /: /' "$REPO_DIR/tts/config.env.example" > "$TTS_DIR/config.env"
+        ok "wrote $TTS_DIR/config.env"
+    fi
+}
+
+# --------------------------------------------------------------- switch -----
+install_switches() {
+    step "Commands"
+    mkdir -p "$BINDIR"
+
+    # The previous design COPIED scripts into $LLM_DIR. The new one symlinks
+    # from the repo, so those copies are stale and actively harmful: an old
+    # ask.py in $LLM_DIR hardcodes the llama.cpp model name and would be used
+    # in preference to the current one.
+    local f
+    for f in common.sh llm ask.sh ask.py bench.sh up.sh down.sh start.sh stop.sh status.sh llm-run; do
+        if [ -f "$LLM_DIR/$f" ]; then
+            rm -f "$LLM_DIR/$f"
+            info "removed stale $LLM_DIR/$f"
+        fi
+    done
+    [ -d "$LLM_DIR/llama" ] && \
+        info "note: $LLM_DIR/llama holds the old llama.cpp build; remove it by hand if you no longer want it"
+
+    chmod +x "$REPO_DIR/src/llm" "$REPO_DIR/src/ask.sh" "$REPO_DIR/src/bench.sh"
+    ln -sfn "$REPO_DIR/src/llm" "$BINDIR/llm"
+    ok "linked $BINDIR/llm"
+
+    if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+        printf '\n# user-local binaries (llm / tts switches)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.bashrc"
+        info "added ~/.local/bin to PATH in ~/.bashrc"
+    fi
+    case ":$PATH:" in
+        *":$BINDIR:"*) : ;;
+        *) warn "$BINDIR is not on your PATH yet. Run 'exec bash -l', or use the full path." ;;
+    esac
+
+    if [ -f "$LLM_DIR/config.env" ] && ! grep -q 'LLM_MODEL' "$LLM_DIR/config.env"; then
+        # A config.env from the previous llama.cpp build pins LLM_PORT=8080 and
+        # uses the old `:=` form. Sourcing it would silently override the new
+        # defaults, so move it aside rather than delete it — it may hold local
+        # choices worth keeping.
+        mv "$LLM_DIR/config.env" "$LLM_DIR/config.env.pre-ollama"
+        warn "moved the old llama.cpp config to $LLM_DIR/config.env.pre-ollama"
+    fi
+
+    if [ ! -f "$LLM_DIR/config.env" ] && [ -f "$REPO_DIR/config.env.example" ]; then
+        cp "$REPO_DIR/config.env.example" "$LLM_DIR/config.env"
+        ok "wrote $LLM_DIR/config.env"
+    fi
+}
+
+# ------------------------------------------------------------------ main ----
+[ -n "$WANT_LLM" ] || [ -n "$WANT_TTS" ] || {
+    echo
+    echo "  What would you like to install?"
+    ask_yn "LLM — qwen3.5:9b on Ollama?" y && WANT_LLM=1 || WANT_LLM=0
+    ask_yn "TTS — the voice-cloning server?" y && WANT_TTS=1 || WANT_TTS=0
+}
+
+[ "$WANT_LLM" = 1 ] && { install_ollama; pull_model; verify_llm; }
+[ "$WANT_TTS" = 1 ] && { install_tts; build_tts; install_tts_config; }
+install_switches
+
+step "Done"
 cat <<EOF
 
-${B}Done.${N} Nothing is running and nothing will start on its own.
+  Nothing is running and nothing will start on its own.
 
-    ${B}llm on${N}          start the server (waits until it is ready to serve)
-    ${B}llm off${N}         stop it and release the GPU
-    ${B}llm${N}             status
-    ${B}llm help${N}        everything else
+    llm on          start the LLM and load the model
+    llm status      state, model, where it loaded, context
+    ./src/ask.sh "hello"        one-shot prompt
 
-    config       $LLM_DIR/config.env
-    logs         $LLM_DIR/logs/
-    models       $LLM_DIR/models/
+    tts on          start the TTS server and web UI
+    tts status      state, backend, voices
+    tts say "hello" -o out.wav
 
-Then:
-    llm on
-    llm on && ~/llm/ask.sh "say hello"
-
-${D}The server has no API key and no authentication. It binds to a LAN address,
-so anything that can route to this host can use it. Put it behind a tunnel, or
-add a reverse proxy with auth, before it leaves a trusted network.${N}
-
+  Models live in $LLM_DIR (config) and $TTS_DIR (weights, voices, logs).
+  Neither directory is in git.
 EOF
