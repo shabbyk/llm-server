@@ -56,7 +56,7 @@ pub async fn say(
         .send()
         .await
         .with_context(|| {
-            format!("POST {url} — is the TTS server running? Start it with: tts up")
+            format!("POST {url} — is the TTS server running? Start it with: tts on")
         })?;
 
     let status = response.status();
@@ -134,7 +134,7 @@ pub async fn add(cfg: &Config, file: &Path) -> Result<()> {
         .build()?;
 
     let response = http.post(&url).multipart(form).send().await.with_context(|| {
-        format!("POST {url} — is the daemon running? Start it with: tts up")
+        format!("POST {url} — is the daemon running? Start it with: tts on")
     })?;
 
     let status = response.status();

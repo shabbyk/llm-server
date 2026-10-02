@@ -21,10 +21,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Start the server and the web UI, then wait until it is ready
-    Up,
+    #[command(name = "on", visible_aliases = ["up", "start"])]
+    On,
 
     /// Stop the server, and confirm the port and GPU memory were released
-    Down,
+    #[command(name = "off", visible_aliases = ["down", "stop"])]
+    Off,
 
     /// Stop, then start
     Restart,
@@ -67,5 +69,6 @@ pub enum Command {
     Log,
 
     /// Follow KoboldCpp's log (what `tmux attach` used to be for)
+    #[command(visible_alias = "attach")]
     Watch,
 }

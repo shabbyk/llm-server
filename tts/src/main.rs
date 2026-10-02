@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     // process is only sound if the child immediately execs, and the runtime is
     // multithreaded — so this branch is deliberately kept separate from the rest
     // of the dispatch, and returns early in the parent.
-    if matches!(command, Command::Up) {
+    if matches!(command, Command::On) {
         return up(cfg);
     }
 
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
             };
             runtime.block_on(serve(cfg, supervisor, None))
         }
-        Command::Down => runtime.block_on(down(&cfg)),
+        Command::Off => runtime.block_on(down(&cfg)),
         // `restart` stops then starts; `toggle` does exactly one of the two.
         // Both must fork, so the runtime is dropped first.
         Command::Restart => {
@@ -106,13 +106,13 @@ fn main() -> Result<()> {
         Command::Add { file } => runtime.block_on(commands::add(&cfg, &file)),
         Command::Log => commands::tail(&cfg.logs.join("tts.log"), 50),
         Command::Watch => commands::tail(&cfg.server_log(), 100),
-        Command::Up => unreachable!("handled above"),
+        Command::On => unreachable!("handled above"),
     }
 }
 
 // ---------------------------------------------------------------- lifecycle --
 
-/// `tts up`: start the daemon, and wait until it reports ready.
+/// `tts on`: start the daemon, and wait until it reports ready.
 fn up(cfg: Config) -> Result<()> {
     let log = cfg.logs.join("tts.log");
 
@@ -123,7 +123,7 @@ fn up(cfg: Config) -> Result<()> {
         let pid = daemon::read_pid(&cfg)
             .map(|p| format!(" (daemon pid {p})"))
             .unwrap_or_default();
-        eprintln!("tts: already ON{pid}. Use 'tts down' first if you meant to restart.");
+        eprintln!("tts: already ON{pid}. Use 'tts off' first if you meant to restart.");
         std::process::exit(1);
     }
 
@@ -134,7 +134,7 @@ fn up(cfg: Config) -> Result<()> {
     match daemon::daemonize()? {
         daemon::Fork::Parent { notify } => {
             // Wait for the daemon to say it is up (or to die trying) before
-            // returning to the shell, so `tts up` means *ready*, not "spawned".
+            // returning to the shell, so `tts on` means *ready*, not "spawned".
             match daemon::wait_for_ready(notify) {
                 Ok(msg) => {
                     println!("{msg}");
@@ -182,7 +182,7 @@ fn daemon_body(
     daemon::redirect_stdio(Some(log))?;
 
     // Hold the lock for our whole lifetime. Dropping it on exit is what lets the
-    // next `tts up` succeed.
+    // next `tts on` succeed.
     let _lock = daemon::acquire_lock(cfg)?;
     daemon::write_pid(cfg, sys::getpid())?;
 
@@ -195,7 +195,7 @@ fn daemon_body(
     runtime.block_on(serve(cfg.clone(), Some(supervisor), Some(notify)))
 }
 
-/// `tts down`: stop the daemon, and confirm the port and GPU were released.
+/// `tts off`: stop the daemon, and confirm the port and GPU were released.
 async fn down(cfg: &Config) -> Result<()> {
     if !daemon::is_running(cfg) {
         // Nothing holds the lock. Clean up a stale pidfile so status stops
@@ -322,7 +322,7 @@ async fn serve(
     let state = AppState::new(Arc::new(cfg), supervisor.clone());
     let result = axum::serve(listener, server::router(state))
         .with_graceful_shutdown(async {
-            // SIGTERM as well as Ctrl-C. `tts down` and any supervisor use
+            // SIGTERM as well as Ctrl-C. `tts off` and any supervisor use
             // SIGTERM, and handling it lets the TTS server be stopped in an
             // orderly way instead of relying on the PDEATHSIG backstop.
             let mut term = match tokio::signal::unix::signal(
@@ -393,7 +393,7 @@ async fn status(cfg: &Config) -> Result<()> {
             cfg.webui_port
         );
     } else {
-        println!("  webui  OFF   start with: tts up");
+        println!("  webui  OFF   start with: tts on");
     }
 
     match client::fetch_voices(cfg).await {
@@ -423,7 +423,7 @@ async fn voices_cmd(cfg: &Config) -> Result<()> {
         }
         Err(e) => {
             eprintln!("tts: cannot reach the TTS server on {}: {e}", cfg.port);
-            eprintln!("     Start it with: tts up");
+            eprintln!("     Start it with: tts on");
             std::process::exit(1);
         }
     }

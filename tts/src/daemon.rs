@@ -1,6 +1,6 @@
 //! Daemonisation and liveness.
 //!
-//! This replaces tmux. `tts up` forks, calls `setsid()`, and redirects stdio, so
+//! This replaces tmux. `tts on` forks, calls `setsid()`, and redirects stdio, so
 //! the process is reparented to init and detached from the controlling terminal
 //! — nothing sends it SIGHUP when the shell closes.
 //!

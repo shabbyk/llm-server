@@ -9,9 +9,21 @@ llm off     # stop, and confirm the GPU was released
 llm         # status
 ```
 
-Not Ollama on purpose. Its ROCm build leaves out `gfx1032`, which is the RX 6600,
-and it has no Vulkan runner. llama.cpp ships one Vulkan backend that covers AMD,
-Intel and Apple Silicon with the same binary.
+## Hardware: RX 6600 (`gfx1032`), which ROCm does not support
+
+The target card is a **Radeon RX 6600**. ROCm ships support for `gfx1030`,
+`gfx1100`, `gfx1101` and `gfx1102` — **`gfx1032` is not among them**, so any
+ROCm-based stack treats this GPU as unsupported and falls back to the CPU, or
+needs `HSA_OVERRIDE_GFX_VERSION` to pretend to be a neighbouring target.
+
+That is what rules out Ollama's default AMD path here. Ollama has since added a
+Vulkan runner, so it is no longer strictly unusable on this card, but the backend
+is chosen for you: a silent fallback to CPU looks exactly like a slow model, and
+on this machine that failure has already been mistaken for a wedged GPU once.
+llama.cpp ships one Vulkan backend covering AMD, Intel and Apple Silicon with the
+same binary, records in its log which backend actually initialised, and takes
+explicit flags — so `backend: Vulkan0` is something you can check rather than
+assume.
 
 Tested on Ubuntu 26.04, Ryzen 5 5600X, RX 6600 (8 GB), Mesa 26.0.8,
 Vulkan 1.4.335, llama.cpp b11146. Debian 13 and 12 work too, with one extra step
@@ -244,9 +256,9 @@ server except the machine — different port, different process, different runti
 directory (`~/tts`).
 
 ```bash
-tts up          # start; returns when ready
+tts on          # start; returns when ready
 tts say "Hello there." -v me.wav -o out.wav
-tts down
+tts off
 ```
 
 See [tts/README.md](tts/README.md) for the full guide, including the one

@@ -283,7 +283,7 @@ pub async fn upload(State(state): State<AppState>, mut form: Multipart) -> Respo
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "This server is fronting a TTS process it does not own, so it cannot restart it \
-             to load a new voice. Start it with `tts up` instead of `--attach`.",
+             to load a new voice. Start it with `tts on` instead of `--attach`.",
         );
     };
 

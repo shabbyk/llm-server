@@ -25,29 +25,37 @@ your own recordings, which is why it is gitignored.
 
 ```bash
 cargo build --release          # see "Building" below if this fails
-./target/release/tts up        # start; returns when ready
+./target/release/tts on        # start; returns when ready
 ./target/release/tts status    # state, model, backend, ports, voices
 ./target/release/tts say "Hello there." -v ref_synthetic.wav -o out.wav
-./target/release/tts down      # stop, and confirm the GPU was released
+./target/release/tts off       # stop, and confirm the GPU was released
 ```
 
-The web UI is on <http://localhost:8081/> once `tts up` has returned. `tts up`
+The web UI is on <http://localhost:8081/> once `tts on` has returned. `tts on`
 prints the LAN address too.
 
 ## Commands
 
 ```
-tts up                 start (detached), wait until ready
-tts down               stop; waits for the port and the process to actually go
-tts restart            down then up
-tts toggle             up if down, down if up
-tts status             state, model, backend, ports, voice list
-tts serve [--attach]   foreground; --attach fronts an already-running TTS server
+tts on                  start (detached); returns when ready
+tts off                 stop; waits for the port and the process to actually go
+tts restart             off, then on
+tts toggle              on if off, off if on
+tts status              state, model, backend, ports, voice list
+tts serve [--attach]    foreground; --attach fronts an already-running TTS server
 tts say "text" [-v VOICE] [-o FILE]      text to WAV (reads stdin if no text)
-tts voices             the advertised voice names
-tts add FILE           install a reference clip as a voice, then restart
-tts log                follow the wrapper's log
-tts watch              follow KoboldCpp's log live
+tts voices              the advertised voice names
+tts add FILE            install a reference clip as a voice, then restart
+tts log                 follow the wrapper's log
+tts watch               follow KoboldCpp's log live
+```
+
+`on` and `off` are the canonical verbs, deliberately matching `llm`. The
+aliases `up`/`start` and `down`/`stop` are accepted, so both spellings work:
+
+```
+llm on  /  tts on        the same word for the same idea
+llm off /  tts off
 ```
 
 `say` and `voices` talk straight to the TTS server, so they work even with no
@@ -59,7 +67,7 @@ the engine.
 Two decisions in here are worth knowing, because they replace things that used to
 break:
 
-**Detaching.** `tts up` forks twice and calls `setsid()`, so the daemon is
+**Detaching.** `tts on` forks twice and calls `setsid()`, so the daemon is
 reparented to init and detached from your terminal. Closing the shell does not
 stop it. This replaces tmux.
 
