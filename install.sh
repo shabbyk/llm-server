@@ -824,11 +824,14 @@ cat <<EOF
   TTS weights and voices live in $TTS_DIR.
   Neither directory is in git.
 
-  To remove the whole stack later:
+  To remove things later, per tool or all at once:
 
-    ./uninstall.sh --dry-run    show what would go, change nothing
-    ./uninstall.sh              remove the software, keep your models
-    ./uninstall.sh --purge      remove the ~14 GB of downloads too
+    ./uninstall.sh --list         what is installed, and what each tool costs
+    ./uninstall.sh --dry-run      show what would go, change nothing
+    ./uninstall.sh                remove the software, keep your models
+    ./uninstall.sh --purge        remove the ~14 GB of downloads too
+
+  e.g. ./uninstall.sh ollama --remove-model frees 8 GB and leaves llama.cpp alone
 EOF
 
 if [ "$WANT_RAG" = 1 ]; then

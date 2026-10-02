@@ -1,36 +1,32 @@
 #!/usr/bin/env bash
-# Remove the local AI stack that install.sh installed.
+# Remove parts of the local AI stack, tool by tool.
 #
-#   ./uninstall.sh                 # remove the software, keep your data
-#   ./uninstall.sh --dry-run       # print what would go; change nothing
-#   ./uninstall.sh --purge         # also remove models and weights (~14 GB)
-#   ./uninstall.sh --purge-all     # ...and your voice clips, documents, chats
-#   ./uninstall.sh --llm --rag     # only those components
-#   ./uninstall.sh --yes           # no prompts
-#   ./uninstall.sh --remove-toolchain
-#   ./uninstall.sh --help
+#   ./uninstall.sh                          # everything, software only
+#   ./uninstall.sh ollama --remove-model    # Ollama and its model blobs,
+#                                           #   leaving llama.cpp untouched
+#   ./uninstall.sh llamacpp                 # llama.cpp runtime only
+#   ./uninstall.sh llamacpp --remove-model  #   ...and the 5 GB GGUF
+#   ./uninstall.sh tts --remove-model       # TTS and its 2.6 GB of weights
+#   ./uninstall.sh webui rag --purge        # those two, with their state
+#   ./uninstall.sh all --purge-all          # everything, including your content
+#   ./uninstall.sh --dry-run                # print the plan; change nothing
+#   ./uninstall.sh --list                   # what is installed, and how big
 #
-# The tiers are the whole design, so they are worth reading once.
+#   Tools:  ollama  llamacpp  tts  webui  rag
+#   Groups: llm (ollama + llamacpp), all
 #
-#   DEFAULT removes software, which can be fetched again:
-#     the runtimes (Ollama, llama.cpp), the Python virtualenvs, the TTS engine,
-#     the `llm` / `tts` / `webui` / `rag` commands, and the PATH line the
-#     installer added to ~/.bashrc. About 5 GB.
+# Data flags apply to whichever tools you named, so the same script can remove a
+# 28 MB runtime while leaving a 6 GB download in place:
 #
-#   --purge also removes data, which is slow to fetch again:
-#     the models and weights — around 14 GB of downloads — plus logs and config
-#     files. Your own content is still left alone.
+#   (none)          software only. The runtime, which is one download to restore.
+#   --remove-model  also the model or weights: the large, slow downloads.
+#   --purge         also logs, config and other state.
+#   --purge-all     also your content: voice clips, documents, chat history.
+#                   None of that can be downloaded again.
 #
-#   --purge-all also removes your content: voice clips, documents, and the chat
-#     database. That is neither downloadable nor recoverable.
-#
-#   NEVER removed, whatever you pass:
-#     system packages installed with apt (build-essential, libvulkan1) and the
-#     Rust toolchain. Those are shared with the rest of the machine, and deleting
-#     them because this stack is going away is how a cleanup turns into an
-#     outage. They are listed at the end so you can decide yourself.
-#
-# The repository clone is left in place too — you are running this from it.
+# Nothing outside $HOME is ever removed, and apt packages and the Rust toolchain
+# are only ever reported, never deleted — they are shared with the rest of the
+# machine.
 
 set -uo pipefail
 # Deliberately not `set -e`: one path failing to delete should not abandon the
@@ -46,9 +42,6 @@ WEBUI_VENV="${WEBUI_VENV:-$HOME/.venvs/openwebui}"
 RAG_DIR="${RAG_DIR:-$HOME/rag}"
 RAG_VENV="${RAG_VENV:-$HOME/.venvs/rag}"
 
-OLLAMA_BIN="$BINDIR/ollama"
-OLLAMA_LIB="$HOME/.local/lib/ollama"
-
 B=$'\033[1m'; N=$'\033[0m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'
 step() { printf '\n%s==>%s %s\n' "$B" "$N" "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -56,36 +49,80 @@ ok()   { printf '    %s%s%s\n' "$G" "$*" "$N"; }
 warn() { printf '    %swarning:%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '    %serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
-ASSUME_YES=0 ; DRY_RUN=0 ; PURGE=0 ; PURGE_ALL=0 ; REMOVE_TOOLCHAIN=0
-WANT_LLM="" ; WANT_TTS="" ; WANT_WEBUI="" ; WANT_RAG="" ; SELECTED=0
+# --------------------------------------------------------------- the tools ---
+# Each tool declares four kinds of thing. Keeping them separate is what lets
+# `--remove-model` mean the 6 GB of blobs and nothing else.
+ALL_TOOLS=(ollama llamacpp tts webui rag)
 
-usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; }
-
-while [ $# -gt 0 ]; do
+tool_software() { # the runtime: always removed when the tool is selected
     case "$1" in
-        -y|--yes)           ASSUME_YES=1 ;;
-        --dry-run|-n)       DRY_RUN=1 ;;
-        --purge)            PURGE=1 ;;
-        --purge-all)        PURGE=1; PURGE_ALL=1 ;;
-        --remove-toolchain) REMOVE_TOOLCHAIN=1 ;;
-        --llm)              WANT_LLM=1;   SELECTED=1 ;;
-        --tts)              WANT_TTS=1;   SELECTED=1 ;;
-        --webui)            WANT_WEBUI=1; SELECTED=1 ;;
-        --rag)              WANT_RAG=1;   SELECTED=1 ;;
-        -h|--help)          usage; exit 0 ;;
-        *)                  die "unknown option: $1 (try --help)" ;;
+        ollama)   printf '%s\n' "$BINDIR/ollama" "$HOME/.local/lib/ollama" ;;
+        llamacpp) printf '%s\n' "$LLM_DIR/llamacpp" ;;
+        tts)      printf '%s\n' "$TTS_DIR/bin" "$REPO_DIR/tts/target" ;;
+        webui)    printf '%s\n' "$WEBUI_VENV" ;;
+        rag)      printf '%s\n' "$RAG_VENV" ;;
     esac
-    shift
-done
+}
 
-# Naming a component selects it; naming none means all of them.
-if [ "$SELECTED" -eq 0 ]; then
-    WANT_LLM=1; WANT_TTS=1; WANT_WEBUI=1; WANT_RAG=1
-fi
+tool_model() { # the downloads: --remove-model
+    case "$1" in
+        ollama)   printf '%s\n' "$HOME/.ollama" ;;
+        llamacpp) printf '%s\n' "$LLM_DIR/models" ;;
+        tts)      printf '%s\n' "$TTS_DIR/models" ;;
+    esac
+}
+
+tool_state() { # logs, config, pids: --purge
+    case "$1" in
+        ollama)
+            printf '%s\n' "$LLM_DIR/logs/ollama.log" "$LLM_DIR/logs/ollama.pid" ;;
+        llamacpp)
+            printf '%s\n' "$LLM_DIR/logs/llamacpp.log" \
+                          "$LLM_DIR/logs/llamacpp.pid" \
+                          "$LLM_DIR/logs/llamacpp-verify.log" ;;
+        tts)
+            printf '%s\n' "$TTS_DIR/logs" "$TTS_DIR/out" "$TTS_DIR/config.env" ;;
+        webui)
+            printf '%s\n' "$WEBUI_DIR/config.env" "$WEBUI_DIR/webui.log" "$WEBUI_DIR/webui.pid" ;;
+        rag)
+            printf '%s\n' "$RAG_DIR/logs" "$RAG_DIR/config.env" ;;
+    esac
+}
+
+tool_content() { # yours: only --purge-all
+    case "$1" in
+        tts)   printf '%s\n' "$TTS_DIR/voices" ;;
+        rag)   printf '%s\n' "$RAG_DIR/docs" ;;
+        webui) printf '%s\n' "$WEBUI_DIR/data" ;;
+    esac
+}
+
+# The `llm` command and ~/llm/config.env are shared by both engines. Deleting the
+# command because Ollama left would take away llama.cpp's only way to start, so
+# shared things are only touched when both engines are going.
+engine_both() { selected ollama && selected llamacpp; }
+
+shared_links() {
+    engine_both    && printf '%s\n' "$BINDIR/llm"
+    selected tts   && printf '%s\n' "$BINDIR/tts"
+    selected webui && printf '%s\n' "$BINDIR/webui"
+    selected rag   && printf '%s\n' "$BINDIR/rag"
+    return 0
+}
+
+shared_state() {
+    engine_both && printf '%s\n' "$LLM_DIR/config.env" "$LLM_DIR/logs" \
+                            "$LLM_DIR"/config.env.*
+    return 0
+}
+
+# Only under --purge-all: the containing directory, once nothing in it is wanted.
+shared_content() {
+    engine_both && printf '%s\n' "$LLM_DIR"
+    return 0
+}
 
 # ---------------------------------------------------------------- helpers ----
-# Human-readable size. Symlinks are reported as such rather than followed, or
-# every link would appear to be as large as its target.
 describe() {
     local p="$1"
     if [ -L "$p" ];     then printf 'symlink'
@@ -95,8 +132,6 @@ describe() {
     fi
 }
 
-# Total bytes across paths. Symlinks are skipped so their targets are not
-# counted twice.
 total_bytes() {
     local p sum=0 b
     for p in "$@"; do
@@ -112,35 +147,35 @@ human() {
     awk -v b="${1:-0}" 'BEGIN{ split("B KB MB GB TB",u," "); i=1; while (b>=1024 && i<5){b/=1024;i++} printf "%.1f %s", b, u[i] }'
 }
 
-# Print what a removal would take. No side effects at all — this is what the plan
-# uses, so the preview cannot accidentally be the execution.
+# Print what a removal would take. No side effects at all: this is what the plan
+# uses, so the preview can never be the execution.
 show() {
     local p
     for p in "$@"; do
+        [ -n "$p" ] || continue
         [ -e "$p" ] || [ -L "$p" ] || continue
-        printf '    %-48s %s\n' "${p/#$HOME/~}" "$(describe "$p")"
+        printf '    %-46s %s\n' "${p/#$HOME/~}" "$(describe "$p")"
     done
 }
 
-# Actually remove. The size is captured *before* the delete, because afterwards
-# there is nothing left to measure and every line would read "missing".
 remove() {
     local p size
     for p in "$@"; do
+        [ -n "$p" ] || continue
         [ -e "$p" ] || [ -L "$p" ] || continue
 
-        # Nothing outside the home directory is ever a target. Every path this
-        # script builds is under $HOME, so a path that is not means a variable
-        # went wrong — and a destructive script should fail closed on that rather
-        # than discover it after deleting something shared.
+        # Nothing outside the home directory is ever a target. Every path here is
+        # built under $HOME, so one that is not means a variable went wrong — and
+        # a destructive script should fail closed on that rather than find out
+        # afterwards.
         case "$p" in
             "$HOME"/*) ;;
-            *) warn "refusing to remove $p — outside $HOME"; continue ;;
+            *) warn "refusing to remove $p — outside \$HOME"; continue ;;
         esac
 
         size="$(describe "$p")"
         if rm -rf -- "$p" 2>/dev/null; then
-            printf '    removed  %-48s %s\n' "${p/#$HOME/~}" "$size"
+            printf '    removed  %-46s %s\n' "${p/#$HOME/~}" "$size"
         else
             warn "could not remove $p"
         fi
@@ -155,46 +190,110 @@ confirm() {
     case "$reply" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
-# ------------------------------------------------------- build the plan ------
-SOFTWARE=() ; DOWNLOAD=() ; LINK=()
+usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; }
 
-[ "$WANT_LLM" = 1 ] && SOFTWARE+=(
-    "$OLLAMA_BIN" "$OLLAMA_LIB" "$LLM_DIR/llamacpp"
-)
-[ "$WANT_TTS" = 1 ] && SOFTWARE+=(
-    "$TTS_DIR/bin" "$REPO_DIR/tts/target"
-)
-[ "$WANT_WEBUI" = 1 ] && SOFTWARE+=( "$WEBUI_VENV" )
-[ "$WANT_RAG" = 1 ]   && SOFTWARE+=( "$RAG_VENV" )
-
-[ "$WANT_LLM" = 1 ]   && LINK+=( "$BINDIR/llm" )
-[ "$WANT_TTS" = 1 ]   && LINK+=( "$BINDIR/tts" )
-[ "$WANT_WEBUI" = 1 ] && LINK+=( "$BINDIR/webui" )
-[ "$WANT_RAG" = 1 ]   && LINK+=( "$BINDIR/rag" )
-
-if [ "$PURGE_ALL" -eq 1 ]; then
-    # Whole directories, which subsumes every finer path and takes the content
-    # with them.
-    [ "$WANT_LLM" = 1 ]   && DOWNLOAD+=( "$LLM_DIR" "$HOME/.ollama" )
-    [ "$WANT_TTS" = 1 ]   && DOWNLOAD+=( "$TTS_DIR" )
-    [ "$WANT_WEBUI" = 1 ] && DOWNLOAD+=( "$WEBUI_DIR" )
-    [ "$WANT_RAG" = 1 ]   && DOWNLOAD+=( "$RAG_DIR" )
-elif [ "$PURGE" -eq 1 ]; then
-    [ "$WANT_LLM" = 1 ] && DOWNLOAD+=(
-        "$LLM_DIR/models" "$HOME/.ollama" "$LLM_DIR/logs" "$LLM_DIR/config.env"
-    )
-    [ "$WANT_TTS" = 1 ] && DOWNLOAD+=(
-        "$TTS_DIR/models" "$TTS_DIR/logs" "$TTS_DIR/out" "$TTS_DIR/config.env"
-    )
-    [ "$WANT_WEBUI" = 1 ] && DOWNLOAD+=( "$WEBUI_DIR/config.env" )
-    [ "$WANT_RAG" = 1 ]   && DOWNLOAD+=( "$RAG_DIR/config.env" "$RAG_DIR/logs" )
-
-    # Config files the installer moved aside across versions. Globbed, so each
-    # one is checked for existence rather than assumed.
-    for bak in "$LLM_DIR"/config.env.*; do
-        [ -e "$bak" ] && DOWNLOAD+=( "$bak" )
+# Drop duplicates and empty entries. mapfile leaves an empty element behind when
+# a function emits nothing, and those must not reach the plan.
+dedup() {
+    local out=() p q seen
+    for p in "$@"; do
+        [ -n "$p" ] || continue
+        seen=0
+        for q in "${out[@]:-}"; do [ "$q" = "$p" ] && { seen=1; break; }; done
+        [ "$seen" -eq 0 ] && out+=( "$p" )
     done
+    [ "${#out[@]}" -gt 0 ] && printf '%s\n' "${out[@]}"
+    return 0
+}
+
+# -------------------------------------------------------------- arguments ----
+ASSUME_YES=0 ; DRY_RUN=0 ; LIST_ONLY=0
+REMOVE_MODEL=0 ; PURGE=0 ; PURGE_ALL=0 ; REMOVE_TOOLCHAIN=0
+TOOLS=()
+
+selected() {
+    local t
+    for t in "${TOOLS[@]}"; do [ "$t" = "$1" ] && return 0; done
+    return 1
+}
+
+add_tool() {
+    case "$1" in
+        llm)      TOOLS+=(ollama llamacpp) ;;
+        all)      TOOLS=("${ALL_TOOLS[@]}") ;;
+        ollama|llamacpp|tts|webui|rag) TOOLS+=("$1") ;;
+        *)
+            echo "uninstall: unknown tool '$1'" >&2
+            echo "  tools:  ${ALL_TOOLS[*]}" >&2
+            echo "  groups: llm (ollama + llamacpp), all" >&2
+            exit 2
+            ;;
+    esac
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes)           ASSUME_YES=1 ;;
+        --dry-run|-n)       DRY_RUN=1 ;;
+        --list|list)        LIST_ONLY=1 ;;
+        --remove-model)     REMOVE_MODEL=1 ;;
+        --purge)            REMOVE_MODEL=1; PURGE=1 ;;
+        --purge-all)        REMOVE_MODEL=1; PURGE=1; PURGE_ALL=1 ;;
+        --remove-toolchain) REMOVE_TOOLCHAIN=1 ;;
+        --llm)              add_tool llm ;;
+        --tts)              add_tool tts ;;
+        --webui)            add_tool webui ;;
+        --rag)              add_tool rag ;;
+        -h|--help)          usage; exit 0 ;;
+        -*)                 die "unknown option: $1 (try --help)" ;;
+        *)                  add_tool "$1" ;;
+    esac
+    shift
+done
+
+# Naming nothing means everything, which is what a bare `uninstall.sh` has always
+# done.
+[ "${#TOOLS[@]}" -eq 0 ] && TOOLS=("${ALL_TOOLS[@]}")
+
+# --------------------------------------------------------------- --list ------
+if [ "$LIST_ONLY" -eq 1 ]; then
+    printf '%s\n' "  ${B}Installed tools${N}"
+    for t in "${ALL_TOOLS[@]}"; do
+        mapfile -t sw < <(tool_software "$t")
+        present="-"
+        for p in "${sw[@]:-}"; do [ -e "$p" ] && present="installed"; done
+        mapfile -t md < <(tool_model "$t")
+        mapfile -t st < <(tool_state "$t")
+        mapfile -t ct < <(tool_content "$t")
+        md_s=$(total_bytes "${md[@]:-}"); st_s=$(total_bytes "${st[@]:-}"); ct_s=$(total_bytes "${ct[@]:-}")
+        printf '  %-9s %-10s model: %-9s state: %-9s content: %s\n' \
+            "$t" "$present" \
+            "$([ "$md_s" -gt 0 ] && human "$md_s" || echo '-')" \
+            "$([ "$st_s" -gt 0 ] && human "$st_s" || echo '-')" \
+            "$([ "$ct_s" -gt 0 ] && human "$ct_s" || echo '-')"
+    done
+    exit 0
 fi
+
+# ---------------------------------------------------------- build the plan ---
+SOFTWARE=() ; MODEL=() ; STATE=() ; CONTENT=() ; LINKS=()
+
+for t in "${TOOLS[@]}"; do
+    mapfile -t _a < <(tool_software "$t"); SOFTWARE+=( "${_a[@]:-}" )
+    mapfile -t _a < <(tool_model    "$t"); [ "$REMOVE_MODEL" -eq 1 ] && MODEL+=( "${_a[@]:-}" )
+    mapfile -t _a < <(tool_state    "$t"); [ "$PURGE" -eq 1 ]        && STATE+=( "${_a[@]:-}" )
+    mapfile -t _a < <(tool_content  "$t"); [ "$PURGE_ALL" -eq 1 ]    && CONTENT+=( "${_a[@]:-}" )
+done
+
+mapfile -t _a < <(shared_links); LINKS+=( "${_a[@]:-}" )
+[ "$PURGE" -eq 1 ]     && { mapfile -t _a < <(shared_state);   STATE+=( "${_a[@]:-}" ); }
+[ "$PURGE_ALL" -eq 1 ] && { mapfile -t _a < <(shared_content); CONTENT+=( "${_a[@]:-}" ); }
+
+mapfile -t SOFTWARE < <(dedup "${SOFTWARE[@]:-}")
+mapfile -t MODEL    < <(dedup "${MODEL[@]:-}")
+mapfile -t STATE    < <(dedup "${STATE[@]:-}")
+mapfile -t CONTENT  < <(dedup "${CONTENT[@]:-}")
+mapfile -t LINKS    < <(dedup "${LINKS[@]:-}")
 
 # --------------------------------------------------------------- the plan ----
 printf '%s\n' "  ${B}Local AI stack uninstaller${N}"
@@ -202,36 +301,38 @@ printf '  repo: %s\n' "$REPO_DIR"
 [ "$DRY_RUN" -eq 1 ] && printf '  %smode: dry run — nothing will be changed%s\n' "$Y" "$N"
 
 step "Plan"
+printf '  tools: %s\n\n' "${TOOLS[*]}"
 
-comps=""
-[ "$WANT_LLM" = 1 ]   && comps="$comps llm"
-[ "$WANT_TTS" = 1 ]   && comps="$comps tts"
-[ "$WANT_WEBUI" = 1 ] && comps="$comps webui"
-[ "$WANT_RAG" = 1 ]   && comps="$comps rag"
-printf '  components: %s\n\n' "$comps"
+printf '  %sSOFTWARE%s  re-installable:                %s\n' "$B" "$N" "$(human "$(total_bytes "${SOFTWARE[@]:-}")")"
+show "${SOFTWARE[@]:-}"
+[ "${#SOFTWARE[@]}" -eq 0 ] && printf '    (nothing)\n'
 
-printf '  %sSOFTWARE%s to remove — re-installable:        %s\n' "$B" "$N" "$(human "$(total_bytes "${SOFTWARE[@]}")")"
-show "${SOFTWARE[@]}"
-
-if [ "$PURGE" -eq 1 ]; then
-    printf '\n  %sDATA%s to remove — re-downloadable:            %s\n' "$B" "$N" "$(human "$(total_bytes "${DOWNLOAD[@]}")")"
-    if [ "$PURGE_ALL" -eq 1 ]; then
-        printf '    %sincluding your voice clips, documents and chat history%s\n' "$R" "$N"
-    fi
-    show "${DOWNLOAD[@]}"
+if [ "$REMOVE_MODEL" -eq 1 ]; then
+    printf '\n  %sMODELS%s    re-downloadable:               %s\n' "$B" "$N" "$(human "$(total_bytes "${MODEL[@]:-}")")"
+    show "${MODEL[@]:-}"
+    [ "${#MODEL[@]}" -eq 0 ] && printf '    (these tools have no models)\n'
 else
-    printf '\n  %sDATA%s kept: models, weights, logs, configs\n' "$B" "$N"
+    printf '\n  %sMODELS%s    kept (add --remove-model to delete)\n' "$B" "$N"
 fi
 
-printf '\n  %sCOMMANDS%s to unlink:\n' "$B" "$N"
-for p in "${LINK[@]}"; do
-    [ -e "$p" ] || [ -L "$p" ] || { printf '    %-48s not present\n' "${p/#$HOME/~}"; continue; }
-    printf '    %-48s -> %s\n' "${p/#$HOME/~}" "$(readlink "$p" 2>/dev/null || echo file)"
-done
+if [ "$PURGE" -eq 1 ]; then
+    printf '\n  %sSTATE%s     logs, config, pids:\n' "$B" "$N"
+    show "${STATE[@]:-}"
+    [ "${#STATE[@]}" -eq 0 ] && printf '    (none)\n'
+fi
+
+if [ "$PURGE_ALL" -eq 1 ]; then
+    printf '\n  %sCONTENT%s   not downloadable again:        %s\n' "$R" "$N" "$(human "$(total_bytes "${CONTENT[@]:-}")")"
+    show "${CONTENT[@]:-}"
+    [ "${#CONTENT[@]}" -eq 0 ] && printf '    (none)\n'
+fi
+
+printf '\n  %sCOMMANDS%s  to unlink:\n' "$B" "$N"
+show "${LINKS[@]:-}"
+[ "${#LINKS[@]}" -eq 0 ] && printf '    (none)\n'
 
 if [ "$PURGE_ALL" -eq 1 ]; then
     printf '\n  %sThis removes voice clips, documents and chat history.%s\n' "$R" "$N"
-    printf '  None of it is downloadable again.\n'
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -245,37 +346,52 @@ if ! confirm "Proceed?"; then
 fi
 
 # ---------------------------------------------------------------- act --------
-# Stop the servers *before* deleting their binaries, or they keep running with
+# Stop the servers before deleting their binaries, or they keep running with
 # their files unlinked until the next reboot.
 step "Stopping services"
-stopped=0
-for sw in llm tts webui; do
-    [ -x "$BINDIR/$sw" ] || continue
-    if "$BINDIR/$sw" off >/dev/null 2>&1; then
-        ok "$sw stopped"
-        stopped=1
-    else
-        info "$sw: nothing to stop, or it refused"
+_any=0
+if selected ollama || selected llamacpp; then
+    if [ -x "$BINDIR/llm" ]; then
+        if "$BINDIR/llm" off >/dev/null 2>&1; then ok "llm stopped"; _any=1
+        else info "llm: nothing to stop"; fi
     fi
-done
-[ "$stopped" -eq 0 ] && info "no running services found"
-# RAG has no daemon — llama.cpp spawns it per tool call — so deleting the
-# virtualenv is enough.
+fi
+if selected tts && [ -x "$BINDIR/tts" ]; then
+    if "$BINDIR/tts" off >/dev/null 2>&1; then ok "tts stopped"; _any=1
+    else info "tts: nothing to stop"; fi
+fi
+if selected webui && [ -x "$BINDIR/webui" ]; then
+    if "$BINDIR/webui" off >/dev/null 2>&1; then ok "webui stopped"; _any=1
+    else info "webui: nothing to stop"; fi
+fi
+# RAG has no daemon: llama.cpp spawns it per tool call, so deleting the venv is
+# enough.
+[ "$_any" -eq 0 ] && info "no running services found"
 
 step "Removing software"
-remove "${SOFTWARE[@]}"
+remove "${SOFTWARE[@]:-}"
+
+if [ "$REMOVE_MODEL" -eq 1 ]; then
+    step "Removing models and weights"
+    remove "${MODEL[@]:-}"
+fi
 
 if [ "$PURGE" -eq 1 ]; then
-    step "Removing data"
-    remove "${DOWNLOAD[@]}"
+    step "Removing state"
+    remove "${STATE[@]:-}"
+fi
+
+if [ "$PURGE_ALL" -eq 1 ]; then
+    step "Removing your content"
+    remove "${CONTENT[@]:-}"
 fi
 
 step "Removing commands"
-remove "${LINK[@]}"
+remove "${LINKS[@]:-}"
 
-# Revert the PATH line only when nothing needs it any more. If a component
-# remains, its command still lives in ~/.local/bin.
-if [ "$SELECTED" -eq 0 ]; then
+# Revert the PATH line only when no command needs it any more. Removing it while
+# llama.cpp remains installed would take away the `llm` command that starts it.
+if [ "${#TOOLS[@]}" -eq "${#ALL_TOOLS[@]}" ]; then
     step "Restoring ~/.bashrc"
     if grep -q 'user-local binaries' "$HOME/.bashrc" 2>/dev/null; then
         cp "$HOME/.bashrc" "$HOME/.bashrc.bak-uninstall"
@@ -284,9 +400,9 @@ import re, sys
 path = sys.argv[1]
 out, pending = [], False
 for line in open(path):
-    # The comment has been worded differently across installer versions
-    # ("llm on/off switch", "llm / tts switches"), so match it loosely and then
-    # drop the export that followed it.
+    # The comment has been worded differently across installer versions ("llm
+    # on/off switch", "llm / tts switches"), so match it loosely and drop the
+    # export that followed it. A strict match would silently leave the line.
     if re.match(r'\s*#\s*user-local binaries', line):
         pending = True
         continue
@@ -303,7 +419,7 @@ PY
     fi
 else
     step "Leaving ~/.bashrc alone"
-    info "components remain, so their commands still need ~/.local/bin on PATH"
+    info "tools remain, and their commands still need ~/.local/bin on PATH"
 fi
 
 if [ "$REMOVE_TOOLCHAIN" -eq 1 ]; then
@@ -319,23 +435,26 @@ fi
 
 # ------------------------------------------------------------- leftovers -----
 step "Left in place"
-printf '  Shared with the rest of the machine, so not touched:\n'
+printf '  Shared with the rest of the machine, so never deleted:\n'
 for c in cc gcc make vulkaninfo uv rustup; do
-    if command -v "$c" >/dev/null 2>&1; then printf '    %-12s %s\n' "$c" "$(command -v "$c")"; fi
+    command -v "$c" >/dev/null 2>&1 && printf '    %-12s %s\n' "$c" "$(command -v "$c")"
 done
-printf '    %-12s apt packages:  sudo apt remove build-essential libvulkan1 vulkan-tools\n' ""
+printf '    %-12s apt packages:   sudo apt remove build-essential libvulkan1 vulkan-tools\n' ""
 printf '    %-12s Rust toolchain: rustup self uninstall   (or --remove-toolchain)\n' ""
 
-if [ "$PURGE" -ne 1 ]; then
+if [ "$REMOVE_MODEL" -ne 1 ]; then
     step "Data still on disk"
     found=0
-    for p in "$LLM_DIR/models" "$HOME/.ollama" "$TTS_DIR/models"; do
-        [ -e "$p" ] || continue
-        printf '    %-48s %s\n' "${p/#$HOME/~}" "$(describe "$p")"
-        found=1
+    for t in "${TOOLS[@]}"; do
+        mapfile -t md < <(tool_model "$t")
+        for p in "${md[@]:-}"; do
+            [ -e "$p" ] || continue
+            printf '    %-46s %s\n' "${p/#$HOME/~}" "$(describe "$p")"
+            found=1
+        done
     done
     if [ "$found" -eq 1 ]; then
-        printf '  Remove it with: ./uninstall.sh --purge\n'
+        printf '  Remove it with: ./uninstall.sh %s --remove-model\n' "${TOOLS[*]}"
     else
         info "none found"
     fi
@@ -343,26 +462,18 @@ fi
 
 if [ "$PURGE_ALL" -ne 1 ]; then
     found=0
-    for p in "$TTS_DIR/voices" "$RAG_DIR/docs" "$WEBUI_DIR/data"; do
-        [ -e "$p" ] || continue
-        [ "$found" -eq 0 ] && { step "Your content, untouched"; found=1; }
-        printf '    %-48s %s\n' "${p/#$HOME/~}" "$(describe "$p")"
+    for t in "${TOOLS[@]}"; do
+        mapfile -t ct < <(tool_content "$t")
+        for p in "${ct[@]:-}"; do
+            [ -e "$p" ] || continue
+            [ "$found" -eq 0 ] && { step "Your content, untouched"; found=1; }
+            printf '    %-46s %s\n' "${p/#$HOME/~}" "$(describe "$p")"
+        done
     done
-    [ "$found" -eq 1 ] && printf '  Remove it with: ./uninstall.sh --purge-all\n'
+    [ "$found" -eq 1 ] && printf '  Remove it with: ./uninstall.sh %s --purge-all\n' "${TOOLS[*]}"
 fi
 
 step "Done"
-if [ "$PURGE_ALL" -eq 1 ]; then
-    echo "  Everything this installer created has been removed."
-elif [ "$PURGE" -eq 1 ]; then
-    echo "  Software and downloads are gone. Your content remains, along with"
-    echo "  the repository clone."
-else
-    echo "  Software is gone. Models, weights and your content remain, so a"
-    echo "  re-install will reuse them instead of downloading them again."
-fi
-cat <<EOF
-
-    Re-install with:  ./install.sh
-    Remove the clone: rm -rf $REPO_DIR
-EOF
+echo "  Removed: ${TOOLS[*]}"
+[ "$REMOVE_MODEL" -ne 1 ] && echo "  Models kept, so a re-install reuses them instead of downloading again."
+printf '\n    Re-install with:  ./install.sh\n'

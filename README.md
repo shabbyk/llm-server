@@ -449,32 +449,45 @@ ports, so only one runs at a time and switching is just `llm restart`.
 
 ## Uninstall
 
+Per tool, because the tools have very different replacement costs:
+
 ```sh
-./uninstall.sh --dry-run     # show what would go; change nothing
-./uninstall.sh               # remove the software, keep your data
-./uninstall.sh --purge       # also remove the ~14 GB of downloads
-./uninstall.sh --purge-all   # ...and your voice clips, documents, chats
-./uninstall.sh --llm --rag   # only those components
+./uninstall.sh --list                   # what is installed, and how big
+./uninstall.sh ollama --remove-model    # Ollama and its blobs; llama.cpp stays
+./uninstall.sh llamacpp --remove-model  # llama.cpp and its GGUF
+./uninstall.sh tts --remove-model       # TTS and its weights
+./uninstall.sh webui rag --purge        # those two, with their state
+./uninstall.sh all --purge-all          # everything, including your content
+./uninstall.sh --dry-run                # print the plan; change nothing
 ```
 
-`./install.sh --uninstall` forwards to the same script, so there is one entry
-point to remember.
+```
+  Tools:  ollama  llamacpp  tts  webui  rag
+  Groups: llm (ollama + llamacpp), all
+```
 
-The tiers are the design, not an afterthought:
+Four levels of data, applied to whichever tools you named:
 
-| Tier | Reclaims | Removes |
+| Flag | Removes | Cost to restore |
 |---|---|---|
-| **default** | ~5 GB | runtimes, virtualenvs, the `llm`/`tts`/`webui`/`rag` commands, the `~/.bashrc` line |
-| **`--purge`** | ~14 GB more | models and weights, plus logs and configs |
-| **`--purge-all`** | the rest | your voice clips, documents and chat history |
+| *(none)* | the runtime — ~5 GB in total | one download |
+| `--remove-model` | the model or weights | an afternoon: **6.1 GB** Ollama, 5.3 GB llama.cpp, 2.5 GB TTS |
+| `--purge` | logs, config, pids | a few preferences |
+| `--purge-all` | voice clips, documents, chat history | **nothing — it is gone** |
 
-Software goes by default and data stays, because the two have very different
-replacement costs. A runtime is one download you can repeat; 14 GB of models and
-weights is an afternoon; and a cloned voice clip cannot be recovered at all.
-`--purge-all` is the only thing that touches the last category, and it says so in
-red before asking.
+That separation is the whole point. The two LLM engines are a good example: they
+share a switch but not a download, so
 
-`--dry-run` prints the real plan — it is built from the same list the removal
+```sh
+./uninstall.sh ollama --remove-model    # frees 8.3 GB; llama.cpp untouched
+./uninstall.sh llamacpp                 # frees 83 MB; Ollama's 6 GB untouched
+```
+
+Shared things are treated as shared. The `llm` command and `~/llm/config.env`
+serve both engines, so they are only removed when *both* are going — deleting the
+command because Ollama left would take away llama.cpp's only way to start.
+
+`--dry-run` prints the real plan: it is built from the same lists the removal
 uses, so the preview cannot drift from what would actually happen.
 
 Three things it never removes:
@@ -484,6 +497,9 @@ Three things it never removes:
 - **The Rust toolchain** — another project here may depend on it. Opt in with
   `--remove-toolchain`.
 - **The repository clone** — you are running the script from it.
+
+Nothing outside `$HOME` is ever a target, so a path built from a bad variable
+fails closed rather than deleting something shared.
 
 ## Troubleshooting
 
