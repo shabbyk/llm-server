@@ -342,3 +342,39 @@ llm_gpu_mem() {
     gtt="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_gtt_used" 2>/dev/null)"
     printf 'vram %s MB, gtt %s MB' "${vram:-?}" "${gtt:-?}"
 }
+
+# Warn when the model is sitting in system RAM rather than VRAM.
+#
+# Not a performance problem — both placements decode at the same rate — which is
+# exactly why it needs saying: the cost is several GB of RAM that nothing else
+# reports. `llm_processor` says "100% GPU" for both, because the model really is
+# on the GPU either way; GTT is just backed by system memory.
+#
+# The cause is the GPU's runtime power management. When the card runtime-suspends
+# while idle, amdgpu evicts VRAM into GTT, and it stays there until something
+# loads it back. Measured on this box:
+#
+#   after loading the model        vram 5.76 GB   ram used 2.5 GB
+#   immediately after inference    vram 5.76 GB   ram used 2.6 GB   (unchanged)
+#   after 20 seconds idle          vram 0.02 GB   ram used 8.3 GB   (evicted)
+#
+# So inference is innocent and idleness is the trigger. The counters agreed:
+# 208 minutes suspended against 29 minutes active. `llm restart` reloads into
+# VRAM; the README documents how to stop it recurring.
+#
+# Prints a sentence when the model is mostly in GTT, or nothing when it is fine.
+llm_placement_note() {
+    [ "${LLM_ENGINE:-ollama}" = "llamacpp" ] || return 0
+    local d vram gtt model
+    d="$(llm_drm_device_dir)" || return 0
+    vram="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_vram_used" 2>/dev/null)"
+    gtt="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_gtt_used" 2>/dev/null)"
+    model="$(stat -c %s "$LLM_GGUF" 2>/dev/null)"
+    [ -n "${vram:-}" ] && [ -n "${gtt:-}" ] && [ -n "${model:-}" ] || return 0
+    model=$(( model / 1000000 ))
+    if [ "$gtt" -gt "$vram" ] && [ "$gtt" -gt $(( model / 2 )) ]; then
+        printf 'model is in system RAM (gtt %s MB against vram %s MB), costing several GB of ordinary memory. The card evicts VRAM when it runtime-suspends; `llm restart` reloads it — see the README to stop it recurring' \
+            "$gtt" "$vram"
+    fi
+    return 0
+}

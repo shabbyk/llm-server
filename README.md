@@ -191,9 +191,57 @@ not run on `gfx1032` anyway.
 Worth knowing: this box also exposes `llvmpipe`, a *software* Vulkan device. Get
 the device selection wrong and you get CPU speed while everything reports as a
 GPU. Ollama picks the discrete card correctly here, but check rather than assume
-— `llm status` prints where the model actually loaded. For llama.cpp it reads the
-offload back out of the server's own log line (`offloaded N/N layers to GPU`),
-because there is no runtime query for the split.
+— `llm status` prints where the model actually loaded.
+
+### The model can silently move into system RAM
+
+This one is invisible and costs several GB, so it is worth understanding.
+
+On llama.cpp the offload figure is **measured**, not reported: `llm status`
+compares the memory the GPU can address against the size of the model file. Both
+VRAM *and* GTT count, because this card's driver uses either, and measuring VRAM
+alone would report a perfectly healthy model as "nothing loaded".
+
+That same fact has a sting. The model loads into VRAM — 2.5 GB of system RAM in
+use — and then, **while idle**, the GPU runtime-suspends and amdgpu evicts VRAM
+into GTT. System RAM use jumps to ~8.4 GB with no error anywhere:
+
+| | VRAM | GTT | RAM used |
+|---|---|---|---|
+| after loading the model | 5.76 GB | 1.16 GB | 2.5 GB |
+| immediately after inference | 5.76 GB | 1.17 GB | 2.6 GB |
+| after 20 seconds idle | 0.02 GB | 6.92 GB | **8.3 GB** |
+
+Inference is innocent — the second row is unchanged from the first. Idleness is
+the trigger. The driver's own counters agreed: **208 minutes suspended against 29
+minutes active**.
+
+`llm status` now says so when it happens:
+
+```
+  note: model is in system RAM (gtt 7428 MB against vram 16 MB), costing several
+        GB of ordinary memory. The card evicts VRAM when it runtime-suspends;
+        `llm restart` reloads it — see the README to stop it recurring
+```
+
+`llm restart` reclaims it, but it will recur the next time the card idles. To
+stop it, keep the GPU out of runtime suspend:
+
+```sh
+# until reboot
+echo on | sudo tee /sys/class/drm/card0/device/power/control
+
+# permanently
+printf 'ACTION=="add", SUBSYSTEM=="pci", DRIVER=="amdgpu", ATTR{power/control}="on"\n' \
+  | sudo tee /etc/udev/rules.d/99-amdgpu-runpm.rules
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+`amdgpu.runpm=0` on the kernel command line does the same thing more bluntly.
+
+The trade is idle power draw — without runtime suspend the card stays powered,
+roughly 10–20 W. On a desktop that is usually worth 6 GB of RAM, and worth even
+more on a machine that also runs the chat UI and a desktop session.
 
 ## The switch
 

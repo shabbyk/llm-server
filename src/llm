@@ -206,6 +206,11 @@ do_on() {
     if [ "$LLM_ENGINE" = "llamacpp" ]; then
         echo "  chat UI:   $(llm_display_url)/"
     fi
+
+    # The model can be on the GPU and still be costing you system RAM. Say so.
+    local note; note="$(llm_placement_note)"
+    [ -n "${note:-}" ] && echo "  note:      $note" >&2
+    return 0
 }
 
 do_off() {
@@ -309,6 +314,9 @@ do_status() {
     if [ "$LLM_ENGINE" = "llamacpp" ]; then
         printf '  chat UI:  %s\n' "$(llm_display_url)/"
     fi
+
+    local note; note="$(llm_placement_note)"
+    [ -n "${note:-}" ] && printf '  note:     %s\n' "$note"
 
     if [ "$LLM_ENGINE" = "ollama" ] && [ -x "$OLLAMA_BIN" ]; then
         printf '  installed:\n'
