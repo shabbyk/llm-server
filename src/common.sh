@@ -242,30 +242,38 @@ for m in d.get("data", []):
 #
 # Ollama can be asked, and reports the bytes it placed in VRAM. llama.cpp cannot,
 # and this build logs nothing about the split at default verbosity, so the answer
-# is measured instead: the VRAM the driver reports, against the size of the model
-# file. A fully offloaded model plus its KV cache always exceeds the file size; a
-# partial offload lands proportionally below it.
+# is measured: the memory the GPU can address, against the size of the model
+# file.
 #
-# Caveat: any other process holding VRAM inflates the figure. On a box where this
-# is the only GPU tenant that is not a concern, and it beats the alternative of
-# reporting a number derived from the -ngl flag, which is a request rather than a
-# result — that would claim success even when the offload silently failed.
+# Both pools count, and that is the whole trick. On this card the driver backs
+# model allocations with GTT — system RAM the GPU addresses — as readily as with
+# dedicated VRAM, and it moves between the two across loads. Measured here: the
+# same model and settings landed as "vram 6188 / gtt 1282" one load and
+# "vram 16 / gtt 7422" the next, both running at ~21 tok/s. Counting VRAM alone
+# reports the second case as "nothing loaded", which is the misreading this
+# figure exists to prevent.
+#
+# Caveat: any other process holding either pool inflates the total. On a box
+# where this is the only GPU tenant that is not a concern, and it still beats
+# deriving the answer from -ngl, which is a request rather than a result.
 llm_processor() {
     case "$LLM_ENGINE" in
         llamacpp)
-            local d vram size pct
+            local d vram gtt size used pct
             d="$(llm_drm_device_dir)" || return 0
             vram="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_vram_used" 2>/dev/null)"
+            gtt="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_gtt_used" 2>/dev/null)"
             size="$(stat -c %s "$LLM_GGUF" 2>/dev/null)"
             [ -n "$vram" ] && [ -n "$size" ] && [ "$size" -gt 0 ] || return 0
-            pct=$(( 100 * vram / (size / 1000000) ))
+            used=$(( ${vram:-0} + ${gtt:-0} ))
+            pct=$(( 100 * used / (size / 1000000) ))
             [ "$pct" -gt 100 ] && pct=100
             if [ "$pct" -ge 95 ]; then
                 printf '100%% GPU'
             elif [ "$pct" -ge 10 ]; then
                 printf '%s%% GPU, %s%% CPU' "$pct" "$((100 - pct))"
             else
-                printf 'CPU only (no VRAM in use)'
+                printf 'CPU only (nothing loaded on the GPU)'
             fi
             ;;
         *)

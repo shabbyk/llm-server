@@ -461,8 +461,14 @@ one run `LLM_ENGINE=llamacpp llm on`.
 
 **`llm on` says not fully on the GPU.** Check `vulkaninfo --summary` lists RADV,
 and that you are in the `render` group: `id | grep render`. Log out and back in
-after being added. On llama.cpp the figure is measured — VRAM against the size of
-the model file — so another process holding the card will distort it.
+after being added.
+
+On llama.cpp the figure is **measured**, not reported: it compares the memory the
+GPU can address — VRAM *and* GTT — against the size of the model file. Both pools
+count because this card's driver backs model allocations with either, and moves
+between them across loads; measuring VRAM alone reports a perfectly healthy
+GTT-resident model as "nothing loaded". The cost is that any other process using
+the card inflates the figure.
 
 **The model answers but ignores instructions.** Check the context. Ollama's own
 default is 4096 and it truncates silently; this repository sets 32768, but a
