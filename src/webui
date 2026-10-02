@@ -5,14 +5,15 @@
 #   webui on           # start, wait until it answers
 #   webui off          # stop
 #   webui toggle / restart
-#   webui status       # state, URL, whether Ollama is reachable
+#   webui status       # state, URL, whether the model is reachable
 #   webui url          # just the URL, for scripting
 #   webui log          # follow its log
 #   webui help
 #
 # Open WebUI is a front end only: it holds no model of its own. It talks to
-# Ollama on 11434 for chat, and (if configured) to the TTS server on 8081 for
-# speech. `webui on` does not start either of those — it tells you if they are
+# whichever engine `llm` is running — Ollama natively, or llama.cpp through its
+# OpenAI-compatible API — and (if configured) to the TTS server on 8081 for
+# speech. `webui on` does not start either of those; it tells you if they are
 # missing rather than pretending.
 #
 # Nothing here starts automatically, matching `llm` and `tts`.
@@ -64,14 +65,30 @@ start() {
 
     # Tell it where the model lives, and where speech comes from, at start time.
     # These are read from the environment by Open WebUI on boot.
-    local ollama_url; ollama_url="$(llm_base)"
+    #
+    # The two engines need different variables, and getting this wrong fails
+    # quietly: Ollama has its own connection type, while llama.cpp is simply an
+    # OpenAI-compatible endpoint. Point the model at the wrong one and the UI
+    # shows an empty model list with no error anywhere.
+    local base; base="$(llm_base)"
+    local model_env=()
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        model_env=(
+            ENABLE_OPENAI_API=true
+            OPENAI_API_BASE_URLS="${base}/v1"
+            OPENAI_API_KEYS="not-needed"
+        )
+    else
+        model_env=( OLLAMA_BASE_URL="$base" )
+    fi
+
     # Run from the data directory. Open WebUI writes some files relative to the
     # process CWD -- its secret key among them -- so launching from the repo put
     # .webui_secret_key in the working tree, where it very nearly got committed.
     #
     # `exec` so the pid we background is the server, not an intermediate shell.
     ( cd "$WEBUI_DIR" && exec env \
-        OLLAMA_BASE_URL="$ollama_url" \
+        "${model_env[@]}" \
         WEBUI_SECRET_KEY_FILE="$WEBUI_DIR/.webui_secret_key" \
         AUDIO_TTS_OPENAI_API_BASE_URL="http://127.0.0.1:${TTS_WEBUI_PORT:-8081}/v1" \
         AUDIO_TTS_OPENAI_API_KEY="not-needed" \
@@ -87,7 +104,7 @@ start() {
     local i
     for i in $(seq 1 120); do
         if webui_serving; then
-            pgrep -f "open-webui serve" 2>/dev/null | head -1 > "$WEBUI_PID"
+            pgrep -f "$(webui_python) serve" 2>/dev/null | head -1 > "$WEBUI_PID"
             return 0
         fi
         sleep 1
@@ -113,9 +130,9 @@ do_on() {
     # A front end with no model behind it is the confusing failure, so say so
     # now rather than letting the UI show an empty model list later.
     if llm_serving; then
-        echo "  ollama: reachable at $(llm_base)"
+        echo "  model:  reachable at $(llm_base) ($LLM_ENGINE)"
     else
-        echo "  ollama: NOT running — start it with 'llm on', or the model list will be empty" >&2
+        echo "  model:  NOT running — start it with 'llm on', or the model list will be empty" >&2
     fi
     if curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:${TTS_WEBUI_PORT:-8081}/api/health" 2>/dev/null; then
         echo "  tts:    reachable — speech output is available in the UI"
@@ -131,7 +148,12 @@ do_off() {
         return 0
     fi
     local pids
-    pids="$(pgrep -f 'open-webui serve' 2>/dev/null | tr '\n' ' ')"
+    # Match the venv's own binary rather than the bare name "open-webui serve".
+    # A generic pattern also matches any shell whose command line happens to
+    # contain those words — including one running this script — and killing the
+    # caller is a memorable way to find that out. The installed path is specific
+    # enough that it cannot collide by accident.
+    pids="$(pgrep -f "$(webui_python) serve" 2>/dev/null | tr '\n' ' ')"
     if [ -n "$pids" ]; then
         # shellcheck disable=SC2086
         kill $pids 2>/dev/null && echo "  stopped Open WebUI"
@@ -158,8 +180,8 @@ do_status() {
     if webui_serving; then echo "ON   $(webui_url)"; else echo "OFF  (start with: webui on)"; fi
     printf '  data:     %s\n' "$WEBUI_DIR"
 
-    printf '  ollama:   '
-    if llm_serving; then echo "reachable at $(llm_base)"; else echo "NOT running (llm on)"; fi
+    printf '  model:    '
+    if llm_serving; then echo "reachable at $(llm_base) ($LLM_ENGINE)"; else echo "NOT running (llm on)"; fi
     printf '  tts:      '
     if curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:${TTS_WEBUI_PORT:-8081}/api/health" 2>/dev/null; then
         echo "reachable on ${TTS_WEBUI_PORT:-8081}"

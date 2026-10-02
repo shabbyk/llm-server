@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# On/off switch for retrieval-augmented generation.
+#
+#   rag              # same as "rag status"
+#   rag on           # attach retrieval to the model, and restart it
+#   rag off          # detach it
+#   rag status       # installed, attached, what it can see
+#   rag test         # exercise search, fetch and ranking against the network
+#   rag docs         # what the document folder holds
+#   rag mcp          # print the MCP config for the model
+#   rag serve        # run the HTTP transport in the foreground (for debugging)
+#   rag help         # this list
+#
+# This switch does NOT start a daemon, and that is deliberate.
+#
+# llama.cpp's server only accepts MCP servers over stdio: it spawns the server
+# itself, talks JSON-RPC over the pipes, and stops it afterwards. Its own
+# documentation is explicit that "nothing has to be started or maintained outside
+# llama-server". So there is no process to supervise here — what `rag on` does is
+# make the model aware of the tool, by setting LLM_MCP in ~/llm/config.env.
+#
+# Detaching is the inverse, and it is a real switch: with LLM_MCP unset the model
+# has no tools at all, which is the safer default. A tool-capable server is a
+# reachable one — the model picks the queries, and it can be talked into picking
+# something by a page it has already read.
+#
+# Only the llama.cpp engine consumes MCP. Ollama does not speak it, so attaching
+# there would install something the model could never call.
+
+set -uo pipefail
+
+RAG_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+RAG_DIR="${RAG_DIR:-$HOME/rag}"
+
+if [ -f "$RAG_DIR/config.env" ]; then
+    # shellcheck disable=SC1091
+    . "$RAG_DIR/config.env"
+fi
+
+: "${RAG_HOST:=127.0.0.1}"
+: "${RAG_PORT:=8082}"
+: "${RAG_VENV:=$HOME/.venvs/rag}"
+: "${RAG_DOCS:=$RAG_DIR/docs}"
+
+RAG_LOGS="$RAG_DIR/logs"
+RAG_LOG="$RAG_LOGS/rag.log"
+RAG_PID="$RAG_LOGS/rag.pid"
+RAG_SERVER="$RAG_SRC/rag_server.py"
+
+# The LLM switch owns the model config, and is reused here so the two cannot
+# disagree about where config.env is or which engine is selected.
+# shellcheck disable=SC1091
+. "$RAG_SRC/common.sh"
+LLM_CONFIG="$LLM_DIR/config.env"
+
+die() { echo "rag: $*" >&2; exit 2; }
+
+require_installed() {
+    [ -x "$RAG_VENV/bin/python" ] || {
+        echo "rag: no virtualenv at $RAG_VENV" >&2
+        echo "     Run the installer: ./install.sh --rag-only" >&2
+        exit 1
+    }
+    [ -f "$RAG_SERVER" ] || die "missing $RAG_SERVER"
+}
+
+# The Cursor-compatible definition llama.cpp expects. `command` is required;
+# entries without it are skipped with a warning, which is exactly the trap this
+# gets right — a URL-based entry looks plausible and is silently ignored.
+rag_mcp_json() {
+    printf '{"mcpServers":{"rag":{"command":"%s","args":["%s"],"env":{"RAG_DOCS":"%s"}}}}' \
+        "$RAG_VENV/bin/python" "$RAG_SERVER" "$RAG_DOCS"
+}
+
+# Is LLM_MCP set (not merely mentioned) in the model config?
+llm_mcp_configured() {
+    [ -f "$LLM_CONFIG" ] || return 1
+    # The active guard form, with a non-empty value:  ... || LLM_MCP='{...}'
+    #
+    # The leading [^#[:space:]] is what makes this a real test. Without it the
+    # pattern also matches the line `rag off` comments out, so status kept
+    # reporting "attached" to a model that had no tools at all.
+    grep -qE "^[[:space:]]*[^#[:space:]].*LLM_MCP='[^']" "$LLM_CONFIG" 2>/dev/null && return 0
+    # Or the ${LLM_MCP:=...} form, for anyone who set it by hand.
+    grep -qE '^[[:space:]]*[^#[:space:]].*"\$\{LLM_MCP:=[^}]+' "$LLM_CONFIG" 2>/dev/null && return 0
+    return 1
+}
+
+# Replace any existing LLM_MCP line with the active one, or append it.
+#
+# The value is written as a guard rather than ${LLM_MCP:=...} because a JSON
+# value contains braces and bash ends a ${...} expansion at the first unescaped
+# }, which silently truncates it. Verified: the := form turns the config into a
+# quote-stripped fragment, and llama.cpp then reports "no servers found in JSON".
+attach() {
+    local json="$1" tmp
+    mkdir -p "$(dirname "$LLM_CONFIG")"
+    [ -f "$LLM_CONFIG" ] || : > "$LLM_CONFIG"
+
+    tmp="$(mktemp)"
+    # Drop both an active setting and the commented-out form, so re-running does
+    # not leave two lines and a confusing precedence puzzle. Lines where LLM_MCP
+    # is mentioned in prose are left alone.
+    grep -vE '^[[:space:]]*#?[[:space:]]*.*LLM_MCP[[:space:]]*=' "$LLM_CONFIG" > "$tmp" || true
+    cat "$tmp" > "$LLM_CONFIG"
+    rm -f "$tmp"
+
+    printf '\n# Added by "rag on". The model reaches the retrieval service as a tool.\n' >> "$LLM_CONFIG"
+    printf "[ -n \"\${LLM_MCP:-}\" ] || LLM_MCP='%s'\n" "$json" >> "$LLM_CONFIG"
+}
+
+detach() {
+    local tmp
+    [ -f "$LLM_CONFIG" ] || return 0
+    tmp="$(mktemp)"
+    # Comment the line rather than delete it: re-enabling is then a one-character
+    # edit, and it is obvious the setting was deliberate.
+    sed -E 's|^([[:space:]]*)(.*LLM_MCP=.*)$|# detached by "rag off"\n\1# \2|' \
+        "$LLM_CONFIG" > "$tmp"
+    cat "$tmp" > "$LLM_CONFIG"
+    rm -f "$tmp"
+}
+
+restart_model_if_running() {
+    if llm_serving; then
+        echo
+        printf '  restarting the model to pick the change up\n'
+        "$RAG_SRC/llm" restart
+    else
+        printf '  the model is not running; it will pick this up on '
+        printf "'llm on'\n"
+    fi
+}
+
+do_on() {
+    require_installed
+
+    if [ "$LLM_ENGINE" != "llamacpp" ]; then
+        # Say it plainly rather than attaching something inert.
+        echo "rag: the active engine is '$LLM_ENGINE', which does not consume MCP tools." >&2
+        echo "     Only llama.cpp does. Switch with LLM_ENGINE=llamacpp in $LLM_CONFIG" >&2
+        echo "     (or: LLM_ENGINE=llamacpp llm on), then run 'rag on' again." >&2
+        exit 1
+    fi
+
+    attach "$(rag_mcp_json)"
+    echo "  attached to the model in $LLM_CONFIG"
+    restart_model_if_running
+}
+
+do_off() {
+    if ! llm_mcp_configured; then
+        echo "rag: already detached"
+        return 0
+    fi
+    detach
+    echo "  detached (LLM_MCP commented out in $LLM_CONFIG)"
+    restart_model_if_running
+}
+
+do_status() {
+    printf '  installed: '
+    if [ -x "$RAG_VENV/bin/python" ] && [ -f "$RAG_SERVER" ]; then
+        "$RAG_VENV/bin/python" -c 'import importlib.metadata as m; print("yes, mcp", m.version("mcp"))' 2>/dev/null \
+            || echo "yes"
+    else
+        printf 'NO — run ./install.sh --rag-only\n'
+    fi
+
+    printf '  attached:  '
+    if llm_mcp_configured; then
+        printf 'yes  (LLM_MCP set in %s)\n' "$LLM_CONFIG"
+    else
+        printf 'no   (turn it on with: rag on)\n'
+    fi
+
+    printf '  engine:    %s' "$LLM_ENGINE"
+    if [ "$LLM_ENGINE" != "llamacpp" ]; then
+        printf '   <- does not consume MCP tools; retrieval is inert'
+    fi
+    printf '\n'
+
+    printf '  model:     '
+    if llm_serving; then printf 'running on %s\n' "$(llm_url)"
+    else printf 'not running\n'; fi
+
+    printf '  docs:      %s' "$RAG_DOCS"
+    if [ -d "$RAG_DOCS" ]; then
+        printf '   (%s file(s))\n' "$(find "$RAG_DOCS" -type f 2>/dev/null | wc -l)"
+    else
+        printf '   (missing)\n'
+    fi
+
+    printf '  tools:     research, web_search, fetch_page, search_docs\n'
+    printf '  exposes:   as rag_research, rag_web_search, rag_fetch_page, rag_search_docs\n'
+}
+
+do_docs() {
+    printf '  folder: %s\n' "$RAG_DOCS"
+    [ -d "$RAG_DOCS" ] || { echo "  (missing — create it and drop files in)"; return 0; }
+    find "$RAG_DOCS" -maxdepth 2 -type f -printf '    %-48f %s bytes\n' 2>/dev/null | head -30
+    [ "$(find "$RAG_DOCS" -type f 2>/dev/null | wc -l)" -eq 0 ] && \
+        echo "    (empty — markdown, text, csv, json, rst and log files are read)"
+    return 0
+}
+
+do_test() {
+    require_installed
+    echo "  retrieval self-test (hits the network)"
+    "$RAG_VENV/bin/python" "$RAG_SERVER" --self-test
+}
+
+# The HTTP transport, in the foreground. Only needed for a client that wants a
+# URL rather than a spawned child.
+do_serve() {
+    require_installed
+    echo "  serving MCP over HTTP on http://$RAG_HOST:$RAG_PORT/mcp"
+    echo "  (llama.cpp does not use this; it spawns the server over stdio)"
+    RAG_HOST="$RAG_HOST" RAG_PORT="$RAG_PORT" RAG_DOCS="$RAG_DOCS" \
+        exec "$RAG_VENV/bin/python" "$RAG_SERVER" --http
+}
+
+# Print the header comment block only, minus the leading "# ".
+usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; }
+
+cmd="${1:-status}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+    on|attach|start|up)   do_on ;;
+    off|detach|stop|down) do_off ;;
+    toggle)               if llm_mcp_configured; then do_off; else do_on; fi ;;
+    restart)              do_off; do_on ;;
+    status|"")            do_status ;;
+    test|selftest)        do_test ;;
+    docs|index)           do_docs ;;
+    mcp|json)             rag_mcp_json; echo ;;
+    serve)                do_serve ;;
+    help|-h|--help)       usage ;;
+    *)                    die "unknown command '$cmd' (try: rag help)" ;;
+esac

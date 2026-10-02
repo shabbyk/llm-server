@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Shared configuration and helpers for the Ollama-backed LLM server.
+# Shared configuration and helpers for the local LLM server.
 # Sourced by every other script. Not executable on purpose — source it.
 #
 # Every setting can be overridden by exporting it, and persistently by creating
 # $LLM_DIR/config.env. Precedence: default -> config.env -> environment.
 #
-# This replaced a llama.cpp + Vulkan build. Ollama vendors the same ggml Vulkan
-# backend, so the GPU story is unchanged; what changed is that the runtime is a
-# server you drive by model name rather than a binary you launch against a file.
+# Two engines are supported, selected by LLM_ENGINE:
+#
+#   ollama     Drive a model by tag. Ollama vendors the same ggml Vulkan backend,
+#              so the GPU story is identical; it adds model management and a
+#              single binary in ~/.local/bin.
+#
+#   llamacpp   Launch `llama-server` against a GGUF file. The server also serves
+#              the llama.ui chat page on the same port, so no separate UI
+#              process is needed. Supports MCP tool servers natively.
+#
+# Both speak the OpenAI API on /v1, so ask.sh, bench.sh and ask.py are oblivious
+# to which one is running.
 
 LLM_DIR="${LLM_DIR:-$HOME/llm}"
 
@@ -17,15 +26,55 @@ if [ -f "$LLM_DIR/config.env" ]; then
     . "$LLM_DIR/config.env"
 fi
 
+# --------------------------------------------------------------- the engine --
+# Which runtime `llm on` starts. Both may be installed; only one runs at a time,
+# each on its own port, so switching is `llm restart`.
+: "${LLM_ENGINE:=ollama}"
+
 # ---------------------------------------------------------------- the model --
-# An Ollama tag, not a file path. `ollama list` shows what is present.
+# Ollama identifies a model by tag; llama.cpp by the path to a GGUF file. Both
+# are set, so switching engines does not lose the other's setting.
 : "${LLM_MODEL:=qwen3.5:9b}"
+: "${LLM_GGUF:=$LLM_DIR/models/Qwen3.5-9B-Q4_K_M.gguf}"
 
 # --------------------------------------------------------------- the runtime --
 # Ollama's binary. The installer drops it in ~/.local/bin so no sudo is needed
 # and, deliberately, no systemd service exists to start on boot.
 : "${OLLAMA_BIN:=$HOME/.local/bin/ollama}"
 : "${OLLAMA_MODELS_DIR:=$HOME/.ollama/models}"
+
+# llama.cpp. The installer extracts a prebuilt Vulkan tarball under here; the
+# binary lives one level down in a tag-named directory, so it is located by
+# search rather than assumed.
+: "${LLAMACPP_DIR:=$LLM_DIR/llamacpp}"
+
+# Layers to offload. 99 means "all of them"; llama.cpp clamps it to the model.
+: "${LLM_NGL:=99}"
+
+# Flash attention. Measured on this box to make no difference to Ollama's
+# prefill (8889 vs 8754 tok/s), so it is off by default until it earns its place.
+: "${LLM_FA:=0}"
+
+# Whether to let a reasoning model think before answering.
+#
+# Qwen3.5 is one, and left alone it can put its whole answer in the reasoning
+# channel and return an empty content field — which reads as a blank reply.
+# Off by default for that reason; ask.py sends `think: false` to Ollama for the
+# same purpose.
+: "${LLM_THINKING:=0}"
+
+# The name llama.cpp advertises over /v1, so clients that say "qwen3.5:9b" keep
+# working when the engine underneath changes. Defaults to LLM_MODEL, which is
+# already exactly that.
+: "${LLM_ALIAS:=}"
+
+# Extra flags appended verbatim to the llama-server command line.
+: "${LLM_EXTRA_ARGS:=}"
+
+# MCP tool servers, as the JSON llama-server expects, e.g.
+#   LLM_MCP='{"mcpServers":{"rag":{"url":"http://127.0.0.1:8082/mcp"}}}'
+# Empty means no tool servers. Setting it also enables the UI's CORS proxy.
+: "${LLM_MCP:=}"
 
 # Pick a routable LAN address, preferring the interface with a default route.
 # Prints 127.0.0.1 if it cannot work one out, which is a safe default: it means
@@ -56,7 +105,15 @@ llm_detect_host() {
 # To serve other machines, set LLM_HOST=0.0.0.0 (everything that can route here)
 # or the LAN address, and remember there is no authentication.
 : "${LLM_HOST:=127.0.0.1}"
-: "${LLM_PORT:=11434}"
+
+# Each engine gets its own port. They are different programs with different
+# management APIs, and letting them share a number means `llm status` cannot tell
+# you which one is up. Set LLM_PORT to pin it yourself.
+if [ "$LLM_ENGINE" = "llamacpp" ]; then
+    : "${LLM_PORT:=8090}"
+else
+    : "${LLM_PORT:=11434}"
+fi
 
 # ---------------------------------------------------------------- behaviour --
 # Context window. THE setting to get right on migration: Ollama's own default is
@@ -69,11 +126,35 @@ llm_detect_host() {
 : "${LLM_KEEP_ALIVE:=5m}"
 
 # --------------------------------------------------------------------- paths --
+# Named after the engine, so switching does not overwrite the other's log. For
+# ollama these resolve to exactly the paths the previous version used.
 LLM_LOGS="${LLM_LOGS:-$LLM_DIR/logs}"
-LLM_PID="$LLM_LOGS/ollama.pid"
-LLM_LOG="$LLM_LOGS/ollama.log"
+LLM_PID="$LLM_LOGS/$LLM_ENGINE.pid"
+LLM_LOG="$LLM_LOGS/$LLM_ENGINE.log"
 
 llm_url() { printf 'http://%s:%s' "$LLM_HOST" "$LLM_PORT"; }
+
+# The llama-server binary, wherever the installer left it. The tarball extracts
+# into a tag-named directory (llama-b11146/), so the path is discovered rather
+# than hardcoded — a new tag would otherwise silently break `llm on`.
+llamacpp_bin() {
+    local b
+    b="$(find "$LLAMACPP_DIR" -maxdepth 3 -type f -name 'llama-server' 2>/dev/null | head -1)"
+    printf '%s' "$b"
+}
+
+# The endpoint that means "this engine is up".
+#
+# Ollama answers /api/version; llama.cpp answers /health, and returns 503 while
+# it is still loading weights. That difference is why curl is called with -f:
+# without it a 503 counts as success and `llm on` would report ready before the
+# model is in memory.
+llm_health_path() {
+    case "$LLM_ENGINE" in
+        llamacpp) printf '%s' "/health" ;;
+        *)        printf '%s' "/api/version" ;;
+    esac
+}
 
 # The base URL to actually talk to.
 #
@@ -82,7 +163,7 @@ llm_url() { printf 'http://%s:%s' "$LLM_HOST" "$LLM_PORT"; }
 # Reporting "OFF" for a server that is answering would be a lie, so fall back to
 # 127.0.0.1 before giving up.
 llm_base() {
-    if curl -sS -o /dev/null --max-time 2 "$(llm_url)/api/version" 2>/dev/null; then
+    if curl -fsS -o /dev/null --max-time 2 "$(llm_url)$(llm_health_path)" 2>/dev/null; then
         printf '%s' "$(llm_url)"
     else
         printf 'http://127.0.0.1:%s' "$LLM_PORT"
@@ -91,8 +172,14 @@ llm_base() {
 
 # Is the server answering? Ask over HTTP rather than checking for a process:
 # `ollama` is also the CLI name, so pgrep matches short-lived client runs too.
+#
+# /v1/models is the fallback because both engines implement it. That matters when
+# the engine was switched without a restart, or a server was started by hand: the
+# configured health path would miss it and `llm off` would refuse to do anything.
 llm_serving() {
-    curl -sS -o /dev/null --max-time 3 "$(llm_base)/api/version" 2>/dev/null
+    curl -fsS -o /dev/null --max-time 3 "$(llm_url)$(llm_health_path)" 2>/dev/null && return 0
+    curl -fsS -o /dev/null --max-time 3 "$(llm_url)/v1/models" 2>/dev/null && return 0
+    curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$LLM_PORT$(llm_health_path)" 2>/dev/null
 }
 
 # The resolved base as host:port, for OLLAMA_HOST.
@@ -109,9 +196,20 @@ ollama_cli() {
     OLLAMA_HOST="$(llm_hostport)" "$OLLAMA_BIN" "$@"
 }
 
-# Which model is resident right now, per the server itself. Empty if none.
+# Which model is resident right now. Empty if none.
+#
+# Ollama reports this itself, and a model can be loaded or evicted independently
+# of the server. llama.cpp has no such distinction — weights are loaded at start
+# and held until the process dies — so if the server answers, the configured GGUF
+# is what is in memory.
 llm_loaded_model() {
-    curl -sS --max-time 5 "$(llm_base)/api/ps" 2>/dev/null | python3 -c '
+    case "$LLM_ENGINE" in
+        llamacpp)
+            llm_serving || return 0
+            llm_openai_model
+            ;;
+        *)
+            curl -sS --max-time 5 "$(llm_base)/api/ps" 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -121,11 +219,57 @@ for m in d.get("models", []):
     print(m.get("name") or m.get("model") or "")
     break
 ' 2>/dev/null
+            ;;
+    esac
 }
 
-# Where the resident model lives: "100% GPU", "41%/59% CPU/GPU", or empty.
+# The model id as the OpenAI API sees it. Both engines implement /v1/models, so
+# this is also the honest answer to "what would a client get".
+llm_openai_model() {
+    curl -fsS --max-time 5 "$(llm_base)/v1/models" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for m in d.get("data", []):
+    print(m.get("id") or "")
+    break
+' 2>/dev/null
+}
+
+# Where the resident model lives: "100% GPU", "41% GPU, 59% CPU", or empty.
+#
+# Ollama can be asked, and reports the bytes it placed in VRAM. llama.cpp cannot,
+# and this build logs nothing about the split at default verbosity, so the answer
+# is measured instead: the VRAM the driver reports, against the size of the model
+# file. A fully offloaded model plus its KV cache always exceeds the file size; a
+# partial offload lands proportionally below it.
+#
+# Caveat: any other process holding VRAM inflates the figure. On a box where this
+# is the only GPU tenant that is not a concern, and it beats the alternative of
+# reporting a number derived from the -ngl flag, which is a request rather than a
+# result — that would claim success even when the offload silently failed.
 llm_processor() {
-    curl -sS --max-time 5 "$(llm_base)/api/ps" 2>/dev/null | python3 -c '
+    case "$LLM_ENGINE" in
+        llamacpp)
+            local d vram size pct
+            d="$(llm_drm_device_dir)" || return 0
+            vram="$(awk '{printf "%d", $1/1000000}' "$d/mem_info_vram_used" 2>/dev/null)"
+            size="$(stat -c %s "$LLM_GGUF" 2>/dev/null)"
+            [ -n "$vram" ] && [ -n "$size" ] && [ "$size" -gt 0 ] || return 0
+            pct=$(( 100 * vram / (size / 1000000) ))
+            [ "$pct" -gt 100 ] && pct=100
+            if [ "$pct" -ge 95 ]; then
+                printf '100%% GPU'
+            elif [ "$pct" -ge 10 ]; then
+                printf '%s%% GPU, %s%% CPU' "$pct" "$((100 - pct))"
+            else
+                printf 'CPU only (no VRAM in use)'
+            fi
+            ;;
+        *)
+            curl -sS --max-time 5 "$(llm_base)/api/ps" 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -140,6 +284,8 @@ for m in d.get("models", []):
     print("100% GPU" if pct >= 99 else f"{pct}% GPU, {100 - pct}% CPU")
     break
 ' 2>/dev/null
+            ;;
+    esac
 }
 
 # The DRM device directory that exposes memory counters, if there is one.

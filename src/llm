@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# On/off switch for the local LLM server, backed by Ollama.
+# On/off switch for the local LLM server.
 #
 #   llm              # same as "llm status"
 #   llm on           # start the server, load the model, wait until ready
 #   llm off          # unload the model, stop the server, confirm VRAM released
 #   llm toggle       # flip: off if running, on if not
 #   llm restart
-#   llm status       # state, model, where it loaded, context, GPU memory
+#   llm status       # state, engine, model, where it loaded, context, GPU memory
 #   llm models       # what is installed, and how big
-#   llm pull [tag]   # fetch a model (default: the configured one)
+#   llm ui           # the chat UI address, when the engine has one
+#   llm pull [tag]   # fetch a model (Ollama only)
 #   llm log          # follow the server log
 #   llm watch        # same thing; kept because the old tmux build had it
 #   llm help         # this list
+#
+# Two engines, selected by LLM_ENGINE in $LLM_DIR/config.env:
+#
+#   ollama     A model driven by tag. Manage it with `llm pull` / `llm models`.
+#   llamacpp   llama-server run against a GGUF file. Also serves the bundled
+#              llama.ui chat page on the same port, so there is no separate UI
+#              process to start.
 #
 # Nothing here starts automatically. After a reboot it stays off until you say
 # "llm on". That is deliberate: it is a switch, not a service. The installer
@@ -26,16 +34,38 @@ LLM_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 die() { echo "llm: $*" >&2; exit 2; }
 
-require_ollama() {
-    [ -x "$OLLAMA_BIN" ] || {
-        echo "llm: ollama not found at $OLLAMA_BIN" >&2
-        echo "     Run the installer: ./install.sh" >&2
-        exit 1
-    }
+# Check the pieces the selected engine needs, and say plainly what is missing.
+require_engine() {
+    case "$LLM_ENGINE" in
+        llamacpp)
+            local b; b="$(llamacpp_bin)"
+            if [ -z "$b" ] || [ ! -x "$b" ]; then
+                echo "llm: llama-server not found under $LLAMACPP_DIR" >&2
+                echo "     Run the installer: ./install.sh --llamacpp-only" >&2
+                exit 1
+            fi
+            if [ ! -f "$LLM_GGUF" ]; then
+                echo "llm: model not found at $LLM_GGUF" >&2
+                echo "     Run the installer, or point LLM_GGUF somewhere else." >&2
+                exit 1
+            fi
+            ;;
+        ollama)
+            [ -x "$OLLAMA_BIN" ] || {
+                echo "llm: ollama not found at $OLLAMA_BIN" >&2
+                echo "     Run the installer: ./install.sh" >&2
+                exit 1
+            }
+            ;;
+        *)
+            die "unknown LLM_ENGINE '$LLM_ENGINE' (expected: ollama or llamacpp)"
+            ;;
+    esac
 }
 
-# Start the server detached, so it outlives the shell that launched it.
-start_server() {
+# ---------------------------------------------------------------- engines ----
+# Ollama: start the server, then load weights with one empty generation.
+start_ollama() {
     mkdir -p "$LLM_LOGS"
     OLLAMA_HOST="$LLM_HOST:$LLM_PORT" \
     OLLAMA_CONTEXT_LENGTH="$LLM_CTX" \
@@ -54,9 +84,76 @@ start_server() {
     return 1
 }
 
+# llama.cpp: the weights are loaded as part of startup, so there is no separate
+# load step. /health only answers 200 once that has finished, which is what makes
+# waiting on it meaningful.
+start_llamacpp() {
+    mkdir -p "$LLM_LOGS"
+    local b; b="$(llamacpp_bin)"
+
+    local args=(
+        -m "$LLM_GGUF"
+        -ngl "$LLM_NGL"
+        -c "$LLM_CTX"
+        --host "$LLM_HOST" --port "$LLM_PORT"
+        --jinja
+        --alias "${LLM_ALIAS:-$LLM_MODEL}"
+    )
+
+    [ "${LLM_FA:-0}" = "1" ] && args+=( -fa )
+
+    # Qwen3.5 is a reasoning model. Left alone it emits its reasoning and can
+    # return an empty content field, which reads as a blank reply. ask.py sends
+    # `think: false` for the same reason against Ollama.
+    #
+    # `--reasoning off` is the current switch. Passing enable_thinking through
+    # --chat-template-kwargs still works, but this build warns on startup that it
+    # is deprecated, so it is not used.
+    if [ "${LLM_THINKING:-0}" = "1" ]; then
+        args+=( --reasoning on )
+    else
+        args+=( --reasoning off )
+    fi
+
+    # Tool servers. --ui-mcp-proxy lets the browser reach them across ports,
+    # which it needs because the UI and the MCP server are different origins.
+    if [ -n "${LLM_MCP:-}" ]; then
+        args+=( --mcp-servers-json "$LLM_MCP" --ui-mcp-proxy )
+    fi
+
+    # Deliberately unquoted: this exists so a user can add flags without editing
+    # the script, and word splitting is the point.
+    # shellcheck disable=SC2206
+    [ -n "${LLM_EXTRA_ARGS:-}" ] && args+=( $LLM_EXTRA_ARGS )
+
+    setsid "$b" "${args[@]}" >>"$LLM_LOG" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+
+    # Generous: a cold 5.7 GB read off disk plus a warm-up pass is tens of
+    # seconds, and a timeout here would look like a crash.
+    local i
+    for i in $(seq 1 120); do
+        if llm_serving; then
+            pgrep -x llama-server 2>/dev/null | head -1 > "$LLM_PID"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+start_server() {
+    case "$LLM_ENGINE" in
+        llamacpp) start_llamacpp ;;
+        *)        start_ollama ;;
+    esac
+}
+
 # Load the weights and return, generating nothing. An empty prompt is the
 # cheapest way to get the model resident and measure where it landed.
+# llama.cpp needs no equivalent — its weights load with the server.
 preload_model() {
+    [ "$LLM_ENGINE" = "llamacpp" ] && return 0
     curl -sS --max-time 600 "$(llm_base)/api/generate" \
         -H 'Content-Type: application/json' \
         -d "{\"model\":\"$LLM_MODEL\",\"prompt\":\"\",
@@ -65,15 +162,16 @@ preload_model() {
         -o /dev/null 2>/dev/null
 }
 
+# ------------------------------------------------------------------- verbs --
 do_on() {
-    require_ollama
+    require_engine
     if llm_serving && [ -n "$(llm_loaded_model)" ]; then
         echo "llm: already ON ($(llm_loaded_model) loaded). Use 'llm off' first if you meant to restart." >&2
         return 1
     fi
 
     if ! llm_serving; then
-        printf '  starting ollama on %s:%s' "$LLM_HOST" "$LLM_PORT"
+        printf '  starting %s on %s:%s' "$LLM_ENGINE" "$LLM_HOST" "$LLM_PORT"
         if ! start_server; then
             printf ' FAILED\n'
             echo "llm: the server did not answer. Check $LLM_LOG" >&2
@@ -82,24 +180,32 @@ do_on() {
         printf ' ok\n'
     fi
 
-    printf '  loading %s' "$LLM_MODEL"
-    if ! preload_model; then
-        printf ' FAILED\n'
-        echo "llm: could not load the model. Is it pulled? Try: llm pull" >&2
-        return 1
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        printf '  loading %s\n' "$(basename "$LLM_GGUF")"
+    else
+        printf '  loading %s' "$LLM_MODEL"
+        if ! preload_model; then
+            printf ' FAILED\n'
+            echo "llm: could not load the model. Is it pulled? Try: llm pull" >&2
+            return 1
+        fi
+        printf ' ready\n'
     fi
 
     # Report where it actually landed. Getting a CPU load when you expected the
     # GPU is the failure this whole script exists to make visible: it looks like
     # a slow model rather than an error.
-    printf ' ready\n'
     local proc; proc="$(llm_processor)"
     echo "  processor: ${proc:-unknown}"
     echo "  context:   $LLM_CTX"
     [ "${proc:-}" = "100% GPU" ] || \
-        echo "  warning: not fully on the GPU. Check the Vulkan driver and that the" >&2
+        echo "  warning: not fully on the GPU. Check the Vulkan driver and that you" >&2
     [ "${proc:-}" = "100% GPU" ] || \
-        echo "           'ollama' user can reach /dev/dri/renderD*." >&2
+        echo "           can reach /dev/dri/renderD* (id | grep render)." >&2
+
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        echo "  chat UI:   $(llm_url)/"
+    fi
 }
 
 do_off() {
@@ -108,21 +214,25 @@ do_off() {
         return 0
     fi
 
-    # Unload first so VRAM is released even if the server lingers.
-    ollama_cli stop "$LLM_MODEL" >/dev/null 2>&1 || true
+    # Unload first so VRAM is released even if the server lingers. Ollama can do
+    # this live; llama.cpp has no unload call, only the process.
+    if [ "$LLM_ENGINE" = "ollama" ]; then
+        ollama_cli stop "$LLM_MODEL" >/dev/null 2>&1 || true
+    fi
 
     # Kill by process name rather than trusting a pidfile.
     #
-    # The pidfile records whatever `pgrep -x ollama` returned at start time,
-    # which is not guaranteed to be the process that ends up owning the port —
-    # so a stale entry made this report "stopped" while the server kept
-    # answering. Ollama has exactly one server process, so matching it by name
-    # is both simpler and correct.
-    local pids
-    pids="$(pgrep -x ollama 2>/dev/null | tr '\n' ' ')"
+    # The pidfile records whatever pgrep returned at start time, which is not
+    # guaranteed to be the process that ends up owning the port — so a stale
+    # entry made this report "stopped" while the server kept answering. Each
+    # engine has exactly one server process, so matching by name is both simpler
+    # and correct.
+    local name pids
+    name=$([ "$LLM_ENGINE" = "llamacpp" ] && echo llama-server || echo ollama)
+    pids="$(pgrep -x "$name" 2>/dev/null | tr '\n' ' ')"
     if [ -n "$pids" ]; then
         # shellcheck disable=SC2086
-        kill $pids 2>/dev/null && echo "  stopped ollama (pid ${pids% })"
+        kill $pids 2>/dev/null && echo "  stopped $name (pid ${pids% })"
     fi
     rm -f "$LLM_PID"
 
@@ -135,7 +245,7 @@ do_off() {
 
     if llm_serving; then
         echo "  SIGTERM was not enough; escalating to SIGKILL" >&2
-        pids="$(pgrep -x ollama 2>/dev/null | tr '\n' ' ')"
+        pids="$(pgrep -x "$name" 2>/dev/null | tr '\n' ' ')"
         if [ -n "$pids" ]; then
             # shellcheck disable=SC2086
             kill -9 $pids 2>/dev/null
@@ -155,45 +265,96 @@ do_off() {
 }
 
 do_status() {
-    printf '  ollama:   '
-    if [ -x "$OLLAMA_BIN" ]; then
-        "$OLLAMA_BIN" --version 2>/dev/null | head -1 || echo "present"
-    else
-        echo "NOT INSTALLED"
-    fi
+    printf '  engine:   %s\n' "$LLM_ENGINE"
+
+    printf '  runtime:  '
+    case "$LLM_ENGINE" in
+        llamacpp)
+            local b; b="$(llamacpp_bin)"
+            if [ -n "$b" ]; then
+                "$b" --version 2>&1 | grep -E '^version:' | head -1 || echo "present"
+            else
+                echo "NOT INSTALLED"
+            fi
+            ;;
+        *)
+            if [ -x "$OLLAMA_BIN" ]; then
+                "$OLLAMA_BIN" --version 2>/dev/null | grep -v '^Warning:' | head -1 || echo "present"
+            else
+                echo "NOT INSTALLED"
+            fi
+            ;;
+    esac
 
     printf '  server:   '
     if llm_serving; then echo "ON   $(llm_url)"; else echo "OFF  (start with: llm on)"; fi
 
-    printf '  model:    %s' "$LLM_MODEL"
-    local loaded; loaded="$(llm_loaded_model)"
-    if [ -n "$loaded" ]; then
-        printf '   loaded\n'
-        printf '  processor: %s\n' "$(llm_processor)"
+    printf '  model:    '
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        printf '%s\n' "$(basename "$LLM_GGUF")"
     else
-        printf '   not loaded\n'
+        printf '%s' "$LLM_MODEL"
+        local loaded; loaded="$(llm_loaded_model)"
+        if [ -n "$loaded" ]; then printf '   loaded\n'; else printf '   not loaded\n'; fi
+    fi
+
+    if llm_serving; then
+        printf '  processor: %s\n' "$(llm_processor)"
     fi
 
     printf '  context:  %s\n' "$LLM_CTX"
     local mem; mem="$(llm_gpu_mem)"
     [ -n "${mem:-}" ] && printf '  gpu mem:  %s\n' "$mem"
 
-    if [ -x "$OLLAMA_BIN" ]; then
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        printf '  chat UI:  %s\n' "$(llm_url)/"
+    fi
+
+    if [ "$LLM_ENGINE" = "ollama" ] && [ -x "$OLLAMA_BIN" ]; then
         printf '  installed:\n'
         ollama_cli list 2>/dev/null | tail -n +2 | awk 'NF {printf "    %-26s %-10s %s\n", $1, $3" "$4, $5" "$6}' | head -10
     fi
 }
 
+# What is on disk, per engine: Ollama tags, or GGUF files.
 do_models() {
-    require_ollama
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        local dir; dir="$(dirname "$LLM_GGUF")"
+        if [ -d "$dir" ]; then
+            printf '  models in %s:\n' "$dir"
+            find "$dir" -maxdepth 1 -type f -name '*.gguf' -printf '    %-42f %s\n' 2>/dev/null \
+                | awk '{printf "%-52s %6.2f GB\n", $1, $2/1073741824}'
+        else
+            echo "  no model directory at $dir"
+        fi
+        return
+    fi
+    require_engine
     ollama_cli list
 }
 
 do_pull() {
-    require_ollama
+    if [ "$LLM_ENGINE" = "llamacpp" ]; then
+        echo "llm: 'pull' is an Ollama verb." >&2
+        echo "     For llama.cpp, re-run the installer or drop a .gguf in $(dirname "$LLM_GGUF")" >&2
+        echo "     and set LLM_GGUF." >&2
+        return 2
+    fi
+    require_engine
     local tag="${1:-$LLM_MODEL}"
     echo "  pulling $tag (this can be several GB)"
     ollama_cli pull "$tag"
+}
+
+# Only llama.cpp has a built-in UI; printing the address beats repeating it.
+do_ui() {
+    if [ "$LLM_ENGINE" != "llamacpp" ]; then
+        echo "llm: the $LLM_ENGINE engine has no built-in chat UI."
+        echo "     Use the Open WebUI switch instead:  webui on"
+        return 0
+    fi
+    llm_serving || { echo "llm: not running. Start it with: llm on" >&2; return 1; }
+    printf '%s\n' "$(llm_url)/"
 }
 
 # Print the header comment block only, minus the leading "# ".
@@ -209,6 +370,7 @@ case "$cmd" in
     restart)        do_off && do_on ;;
     status|"")      do_status ;;
     models|list)    do_models ;;
+    ui|open)        do_ui ;;
     pull)           do_pull "${1:-}" ;;
     log|watch|attach)
         [ -f "$LLM_LOG" ] || die "no log at $LLM_LOG yet"

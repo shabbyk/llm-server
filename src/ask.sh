@@ -39,4 +39,8 @@ fi
 
 # Pure HTTP client: it needs nothing from the GPU. The render group is the
 # *server's* requirement, not the caller's.
-exec python3 "$LLM_SRC/ask.py" "$LLM_HOST" "$LLM_PORT" "$model" "$thinking" "$raw" "$1"
+#
+# The engine is passed through so the client can pick the right API — Ollama's
+# native /api/chat, or llama.cpp's OpenAI-compatible /v1/chat/completions. Both
+# are normalised to the same output.
+exec python3 "$LLM_SRC/ask.py" "$LLM_HOST" "$LLM_PORT" "$model" "$LLM_ENGINE" "$thinking" "$raw" "$1"

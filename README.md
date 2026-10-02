@@ -1,7 +1,8 @@
-# Local AI stack: Ollama LLM + voice-cloning TTS
+# Local AI stack: local LLM + voice-cloning TTS + retrieval
 
 Runs a quantised Qwen3.5-9B and a text-to-speech server with zero-shot voice
-cloning, both on one consumer GPU, both behind an on/off switch.
+cloning, both on one consumer GPU, both behind an on/off switch. Optionally adds
+a small retrieval service so the model can search the web and read your files.
 
 No container, no service manager, nothing that starts on its own.
 
@@ -12,15 +13,31 @@ llm on                # start the model, wait until it can actually answer
 llm off               # unload, and confirm the GPU memory was released
 tts on                # start speech synthesis and its web UI
 tts off
+rag on                # retrieval for the model: web search, your documents
+rag off
 ```
 
-Two independent pieces. Installing one does not require the other:
+Independent pieces. Installing one does not require another:
 
 | | Runtime | Serves | Switch |
 |---|---|---|---|
-| **LLM** | Ollama, user-local | OpenAI-compatible API on 11434 | `llm` |
+| **LLM** | Ollama *or* llama.cpp, user-local | OpenAI-compatible API on 11434 / 8090 | `llm` |
 | **TTS** | KoboldCpp + a Rust wrapper | web UI on 8081, OpenAI-shaped audio API | `tts` |
-| **Chat UI** | Open WebUI | chat interface on 8080 | `webui` |
+| **RAG** | a small Python MCP server | spawned by the model over stdio | `rag` |
+| **Chat UI** | Open WebUI *or* the built-in llama.ui | chat interface on 8080 / 8090 | `webui` |
+
+Two engines are supported, and `llm` drives either one. The difference matters:
+
+| | Ollama | llama.cpp |
+|---|---|---|
+| Model | referenced by tag | a GGUF file on disk |
+| Chat page | none — use Open WebUI | **llama.ui**, built into the server |
+| Tools / MCP | no | **yes** — this is what the RAG service plugs into |
+| Footprint | one 1.4 GB runtime, plus Ollama's own copy of ggml | the binary, plus your GGUF |
+
+Both run on the same Vulkan backend, because Ollama vendors the same ggml code.
+Pick `both` at install time and switch with `LLM_ENGINE`; nothing is destroyed
+either way.
 
 ## Install
 
@@ -29,28 +46,133 @@ Two independent pieces. Installing one does not require the other:
 ./install.sh --yes        # everything, no questions
 ./install.sh --llm-only   # just the model server
 ./install.sh --tts-only   # just text to speech
+./install.sh --llamacpp-only   # llama.cpp + llama.ui + RAG
+./install.sh --rag-only   # just retrieval
 ```
 
-It asks two questions —
+It asks which engine you want —
 
 ```
-  LLM — qwen3.5:9b on Ollama? [Y/n]
+  LLM engine?
+    1) Ollama only     — model referenced by tag; reuse an existing install
+    2) llama.cpp only  — GGUF model, with the llama.ui chat page built in
+    3) Both            — install each; switch with LLM_ENGINE (~12 GB of models)  (default)
+
   TTS — the voice-cloning server? [Y/n]
   Chat UI — Open WebUI on top of the model? [Y/n]
+  RAG — web search and document lookup for the model? [Y/n]
 ```
 
-— then does the rest: installs Ollama, pulls the model, installs a C and Rust
-toolchain if needed, builds the TTS wrapper, and fetches the engine and weights.
-Debian and Ubuntu are supported; anything else is refused rather than
-half-attempted, because the package names and Vulkan setup differ.
+— then does the rest: installs the runtime, fetches the model, installs a C and
+Rust toolchain if needed, builds the TTS wrapper, and sets up the retrieval
+service. The RAG question is only asked when llama.cpp is in play, since that is
+the engine which consumes MCP tools. Debian and Ubuntu are supported; anything
+else is refused rather than half-attempted, because the package names and Vulkan
+setup differ.
 
-Roughly 1.4 GB for the runtime, ~6 GB for the model, ~2.5 GB for the TTS
-weights. The installer is idempotent — re-run it and existing pieces are
-detected and skipped.
+Roughly 1.4 GB for the Ollama runtime (or **30 MB** for llama.cpp), ~5.7 GB for
+the model, ~2.5 GB for the TTS weights, and **37 MB** for the RAG service. The
+installer is idempotent — re-run it and existing pieces are detected and skipped.
 
-**Ollama is installed user-locally into `~/.local`.** No sudo, and deliberately
-**no systemd unit**, so nothing starts on boot. That is the same rule the rest of
-this repository follows: it is a switch, not a service.
+**Everything is installed user-locally under `~`.** No sudo for the runtimes, and
+deliberately **no systemd unit**, so nothing starts on boot. That is the rule the
+rest of this repository follows: it is a switch, not a service.
+
+## llama.cpp and llama.ui
+
+The prebuilt Vulkan tarball is about **30 MB** — no compiler, no Vulkan SDK, no
+`build-essential`. The installer resolves the current nightly tag and extracts it
+under `~/llm/llamacpp/`:
+
+```
+llama-b11146-bin-ubuntu-vulkan-x64.tar.gz    30.6 MB
+```
+
+The version tags carry no binaries; they are attached to the nightly tag, so the
+installer reads `nightly-tag.txt` rather than pinning a version that would rot.
+
+**llama.ui is the same process.** `llama-server` serves its chat page on the same
+port as the API, so there is no second service to start:
+
+```sh
+llm on
+llm ui            # http://127.0.0.1:8090/
+```
+
+Tools are attached with `rag on` rather than by hand — it writes the config and
+restarts the model:
+
+```sh
+rag on
+llm ui            # the tools now appear in the chat page
+```
+
+Under the hood it sets `LLM_MCP` in `~/llm/config.env`. One detail there is worth
+knowing, because getting it wrong fails *silently*: llama.cpp only accepts MCP
+servers over **stdio**, so the entry needs a `command` to spawn, not a `url`.
+An entry with a `url` is skipped with a single warning in the log and the model
+quietly has no tools.
+
+One thing llama.ui does **not** have: speech output. The read-aloud feature in
+[Speech output](#speech-output) is Open WebUI's, and it works by calling the TTS
+server. If reading answers aloud matters more than the built-in page, use Open
+WebUI — it works with either engine.
+
+## RAG: web search and your documents
+
+A small tool server that gives the model web search and access to a folder of your
+documents. It is not a daemon: **llama.cpp spawns it**, speaks to it over stdio,
+and stops it again, which is the only transport llama.cpp supports.
+
+```sh
+rag on            # attach it to the model, and restart the model
+rag off           # detach it
+rag status        # installed, attached, what it can see
+rag test          # exercise search, fetch and ranking, no client needed
+rag docs          # the folder it indexes
+```
+
+Because llama.cpp owns the process, "on" means *attached to the model*, not
+*running a service*. With it off the model simply has no tools — which is the
+safer default, and why it is a deliberate switch rather than automatic.
+
+Four tools:
+
+| Tool | What it does |
+|---|---|
+| `research` | search, read the top pages, and return the best-matching passages in **one call** |
+| `web_search` | just the results — titles, URLs, snippets |
+| `fetch_page` | read one URL as text |
+| `search_docs` | search `~/rag/docs/` |
+
+llama.cpp registers them as `rag_research`, `rag_web_search`, `rag_fetch_page` and
+`rag_search_docs` — the server name is a prefix — and you can see them at
+`http://127.0.0.1:8090/tools`.
+
+`research` exists because a 9B model is not reliable at long tool-calling chains.
+Asking it to search, then read, then read again invites it to stop halfway; giving
+it one call that does the whole loop and returns citable passages plays to its
+strengths.
+
+**How it stays light.** Search is DuckDuckGo's HTML endpoint, so there is **no API
+key and no second service**. Ranking is **BM25** — about thirty lines of
+arithmetic — so there are no embeddings, no torch, and no vector database. The
+virtualenv is **37 MB**, against Open WebUI's 2.5 GB.
+
+The trade is that BM25 matches words rather than meaning: ask for "how do I stop
+a process" and a page saying "terminate a job" will rank poorly. For a local 9B on
+an 8 GB card that is the right trade, because embeddings would mean a second model
+competing for the same VRAM.
+
+**Only llama.cpp can use it.** Ollama does not speak MCP, so `rag on` refuses
+rather than attaching something inert, and tells you to switch engines.
+
+**What it can reach.** The model chooses the queries, and it can be talked into
+choosing them by a page it has already read. Two things limit that: loopback and
+link-local addresses are refused outright — that is where local API keys and
+cloud metadata live — and only `http`/`https` are fetched. `--tools` and MCP both
+also force `--cors-origins localhost` on the server, so only pages served from
+this machine can reach the API.
 
 ## Hardware: RX 6600 (`gfx1032`), which ROCm does not support
 
@@ -61,24 +183,29 @@ needs `HSA_OVERRIDE_GFX_VERSION` to pretend to be a neighbouring target.
 
 Everything here therefore goes through **Vulkan**, which has no card allowlist
 and simply uses whatever the driver exposes. On this machine that is
-`AMD Radeon RX 6600 (RADV NAVI23)` via Mesa, and both Ollama and KoboldCpp drive
-it successfully.
+`AMD Radeon RX 6600 (RADV NAVI23)` via Mesa, and Ollama, llama.cpp and KoboldCpp
+all drive it successfully. That is also why the installer fetches llama.cpp's
+**Vulkan** tarball rather than the ROCm one: the ROCm build is 234 MB and would
+not run on `gfx1032` anyway.
 
 Worth knowing: this box also exposes `llvmpipe`, a *software* Vulkan device. Get
 the device selection wrong and you get CPU speed while everything reports as a
 GPU. Ollama picks the discrete card correctly here, but check rather than assume
-— `llm status` prints where the model actually loaded.
+— `llm status` prints where the model actually loaded. For llama.cpp it reads the
+offload back out of the server's own log line (`offloaded N/N layers to GPU`),
+because there is no runtime query for the split.
 
 ## The switch
 
 ```sh
 llm on        # start the server, load the model, wait until resident
 llm off       # unload, stop the server, report VRAM
-llm status    # state, model, where it loaded, context, installed models
+llm status    # state, engine, model, where it loaded, context, installed models
 llm toggle    # flip
 llm restart
-llm models    # what is installed
-llm pull X    # fetch another model
+llm models    # what is installed (Ollama tags, or GGUF files)
+llm ui        # the chat page address, when the engine has one
+llm pull X    # fetch another model (Ollama only)
 llm log       # follow the server log
 ```
 
@@ -116,24 +243,35 @@ and the useful answer can end up in the reasoning trace rather than in
 ./src/ask.sh -t "plan a refactor"      # thinking ON, slower
 ```
 
+The two engines spell this differently, and `ask.py` translates: Ollama takes
+`think: false` on its native API, while llama.cpp is started with `--reasoning
+off`, which reaches the model's own Jinja template. The server uses that switch
+too, so the built-in llama.ui page behaves the same way.
+
+(`--chat-template-kwargs '{"enable_thinking":false}'` also works and is what
+older documentation shows, but this build warns on startup that it is
+deprecated.)
+
 ## Speed
 
-Qwen3.5-9B Q4_K_M on an RX 6600, Vulkan, measured through the API:
+Qwen3.5-9B Q4_K_M, Vulkan, 32768 context, measured through the API with
+`./src/bench.sh`:
 
-| | Ollama | previous llama.cpp build |
+| | Ollama | llama.cpp |
 |---|---|---|
-| decode | **~23 tok/s** | 21.3 tok/s |
-| prefill | ~200–2600 tok/s | 468–573 tok/s |
-| default context | **4096** (overridden here) | 32768 |
+| decode | 36.9 tok/s | 21.3 tok/s |
+| prefill | 520 tok/s | 234 tok/s |
 
-Decode is the number you feel, and it is a wash — unsurprising, since Ollama
-vendors the same ggml Vulkan backend. Prefill is what long agentic prompts pay,
-and it varies enough run to run that a single number is not worth quoting;
-`./src/bench.sh` measures it properly, discarding the first run that pays the
-model-load cost.
+Decode is the number you feel; prefill is what a long agentic system prompt pays.
 
-Not benchmarked against the old build in a controlled way, so treat the
-comparison as a signal rather than a result.
+Every figure comes from a fresh prompt. The benchmark prepends a unique nonce to
+each run so prompt caching cannot make prefill look better than it is, and it
+discards the first run that pays the model-load cost. Both matter: without them a
+warm cache reports prefill an order of magnitude too high, which is how `llama-bench`
+once reported 36.4 tok/s for a model that actually decoded at 21.3.
+
+Treat these as relative, not absolute. They move with the driver, with what else
+is holding the GPU, and with where the driver chooses to place the model.
 
 ## Text to speech
 
@@ -165,6 +303,21 @@ webui off
 
 Then open <http://localhost:8080/>. **The first account to sign up becomes
 admin** — Open WebUI has its own login and does not ship with one.
+
+**Open WebUI or llama.ui?** They are different tools for different days.
+
+| | Open WebUI | llama.ui |
+|---|---|---|
+| Install | ~2.5 GB venv, 104 packages | nothing — ships with llama.cpp |
+| Read-aloud | **yes**, via the TTS server | no |
+| Memory, notes, code execution | yes, built in | no |
+| Web search | yes, needs a backend | via the RAG service |
+| Weight | heavier, and generates titles and tags in the background | bare, one process |
+
+If you want answers read aloud in a cloned voice, that is Open WebUI — it is the
+only one of the two that can call the TTS server. If you want the fastest,
+smallest thing that can still reach the web through the RAG service, that is
+llama.ui.
 
 `webui on` reports whether the things it needs are running, because a chat UI
 with no model behind it just shows an empty model list and looks broken:
@@ -206,24 +359,34 @@ TTS server speaks OpenAI's audio API directly — no adapter.
 
 ### Web search is off, and needs a backend
 
-Open WebUI **does not include web search**. It calls out to something you
-supply, so enabling it means running a second service or handing over an API
-key. It is left off until you choose:
+Open WebUI **does not include web search**. It calls out to something you supply,
+so enabling it means running a second service or handing over an API key. It is
+left off until you choose.
+
+**The variable names matter.** Older documentation — including an earlier version
+of this file — uses `ENABLE_RAG_WEB_SEARCH` and `RAG_WEB_SEARCH_ENGINE`. This
+version ignores both: setting them looks correct and does nothing at all. The
+names below are the ones that work.
 
 ```sh
-# ~/.openwebui/config.env — self-hosted, no external dependency
-ENABLE_RAG_WEB_SEARCH=true
-RAG_WEB_SEARCH_ENGINE=searxng
-SEARXNG_QUERY_URL=http://127.0.0.1:8888/search?q=<query>
+# ~/.openwebui/config.env
+ENABLE_WEB_SEARCH=true
+WEB_SEARCH_ENGINE=duckduckgo     # no account, no key
 ```
 
-Or `RAG_WEB_SEARCH_ENGINE=brave` with `BRAVE_SEARCH_API_KEY`. Then
-`webui restart`. Everything in that file is exported to the server, so any
-Open WebUI setting can go there.
+DuckDuckGo is the best starting point because it asks nothing of you. About thirty
+other backends ship in this build — `brave`, `searxng`, `google_pse`, `tavily`,
+`exa`, `mojeek` and more — each with its own settings. Then `webui restart`.
+Everything in that file is exported to the server, so any Open WebUI setting can
+go there.
+
+If you are on llama.cpp you do not need this at all: the [RAG
+service](#rag-web-search-and-your-documents) gives that engine web access
+directly, with no key and no second service.
 
 ## Security
 
-Neither service has authentication.
+Neither the model nor the chat UI has authentication.
 
 - **LLM** binds `127.0.0.1` by default. To serve other machines set
   `LLM_HOST=0.0.0.0` in `~/llm/config.env` — and remember that anyone who can
@@ -234,17 +397,32 @@ Neither service has authentication.
   admin, so sign up before exposing the port. Set `WEBUI_HOST=127.0.0.1` in
   `~/.openwebui/config.env` for tunnel-only.
 
-Both defaults are chosen so the *unsafe* option is the one you have to ask for.
+**The retrieval service is the one that reaches outward**, so it is worth being
+precise about. It runs with the same privileges as the model server, because
+llama.cpp spawns it as a child process. What limits it:
+
+- `http` and `https` only; no `file://` or other schemes.
+- Loopback and link-local addresses are refused, which is where local service
+  APIs and cloud metadata endpoints live.
+- It reads a fixed document folder and the open web. It cannot be pointed at
+  arbitrary paths on disk.
+- Enabling MCP (or `--tools`) makes llama-server default `--cors-origins` to
+  `localhost`, so only pages served from this machine can reach the API.
+
+The defaults are chosen so the *unsafe* option is the one you have to ask for.
 
 ## Layout
 
 ```
 install.sh              the installer
 config.env.example      LLM settings, documented
-src/common.sh           shared config and helpers
-src/llm                 the LLM switch
+src/common.sh           shared config and helpers, engine-aware
+src/llm                 the LLM switch (either engine)
 src/ask.sh ask.py       one-shot prompt client (thinking off by default)
-src/bench.sh            prefill/decode measurement
+src/bench.sh            prefill/decode measurement, cache-defeating
+src/rag                 the retrieval switch: attach / detach
+src/rag_server.py       the retrieval service (MCP, stdio)
+src/rag.env.example     its settings
 src/webui               the chat UI switch
 src/webui.env.example   its settings, including the search opt-in
 tts/                    the TTS wrapper: one Rust binary
@@ -255,31 +433,49 @@ Source lives here. Runtime state does not:
 | | |
 |---|---|
 | `~/llm/` | `config.env`, logs |
-| `~/.ollama/` | model blobs |
+| `~/llm/models/` | llama.cpp GGUF files |
+| `~/llm/llamacpp/` | the llama.cpp build |
+| `~/.ollama/` | Ollama model blobs |
 | `~/.local/{bin,lib}/ollama` | the Ollama runtime |
+| `~/rag/` | `config.env`, logs, and `docs/` |
+| `~/.venvs/rag/` | the retrieval Python environment (37 MB) |
 | `~/tts/` | engine, weights, voices, logs |
 | `~/.openwebui/` | the chat UI's database, uploads, settings |
 | `~/.venvs/openwebui/` | its Python environment |
 
-`~/llm/llama/` is the previous llama.cpp build. The installer does not remove it;
-delete it by hand once you are satisfied with Ollama.
+Both engines may be installed at once. They are separate programs on separate
+ports, so only one runs at a time and switching is just `llm restart`.
 
 ## Troubleshooting
 
+**The model has no tools, and the log says "no servers found in JSON".** The MCP
+entry needs a `command` to spawn, not a `url`. llama.cpp's MCP support is
+stdio-only: it runs the program itself and talks over the pipes. An entry written
+with a `url` looks entirely plausible, is skipped with one warning line, and
+leaves the model silently tool-less. `rag on` writes the correct form; check
+`rag status`.
+
+**`rag on` says the engine does not consume MCP tools.** Ollama does not speak
+MCP — only llama.cpp does. Set `LLM_ENGINE=llamacpp` in `~/llm/config.env`, or for
+one run `LLM_ENGINE=llamacpp llm on`.
+
 **`llm on` says not fully on the GPU.** Check `vulkaninfo --summary` lists RADV,
 and that you are in the `render` group: `id | grep render`. Log out and back in
-after being added.
+after being added. On llama.cpp the figure is measured — VRAM against the size of
+the model file — so another process holding the card will distort it.
 
-**The model answers but ignores instructions.** Check the context. Ollama
-silently truncates at its default of 4096; this repository sets 32768, but a
+**The model answers but ignores instructions.** Check the context. Ollama's own
+default is 4096 and it truncates silently; this repository sets 32768, but a
 `~/llm/config.env` from an older install may not.
 
 **`ollama` commands warn "could not connect".** The CLI talks to `127.0.0.1:11434`
-unless told otherwise. If you have set `LLM_HOST` elsewhere, that is expected —
+unless told otherwise. If you have set `LLM_HOST` elsewhere that is expected —
 use `llm status`, which resolves the right address.
 
-**A stale `~/llm/config.env` overrides everything.** The installer moves one from
-the llama.cpp era to `config.env.pre-ollama`, because it pins port 8080.
+**`llm status` shows an unexpected port.** A config written before both engines
+existed pins `LLM_PORT`, which then applies to whichever engine is active. The
+installer comments that line out and keeps a copy at `config.env.pre-engines`.
+Each engine now has its own default: Ollama 11434, llama.cpp 8090.
 
 ## Licence
 

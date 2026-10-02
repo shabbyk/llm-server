@@ -6,17 +6,29 @@
 #   ./install.sh --llm-only
 #   ./install.sh --tts-only
 #   ./install.sh --webui-only
+#   ./install.sh --llamacpp-only
+#   ./install.sh --rag-only
 #   ./install.sh --force      # reinstall things that are already present
 #
-# Two independent pieces:
+# Three independent pieces:
 #
-#   LLM   Ollama running qwen3.5:9b, exposed as an OpenAI-compatible API.
-#         Installed user-locally: no sudo, and deliberately NO systemd unit, so
+#   LLM   A local model, on one of two engines:
+#
+#           ollama     qwen3.5:9b by tag, managed with `llm pull` / `llm models`.
+#           llamacpp   llama-server against a GGUF file. Also serves the bundled
+#                      llama.ui chat page, and speaks MCP so it can use tools.
+#
+#         Either way it is installed user-locally: no sudo, no systemd unit, so
 #         nothing starts on boot. Drive it with `llm on` / `llm off`.
 #
 #   TTS   The Rust wrapper in tts/ plus the KoboldCpp engine and Qwen3-TTS
 #         weights, for text-to-speech with zero-shot voice cloning.
 #         Drive it with `tts on` / `tts off`.
+#
+#   RAG   A small MCP server providing web search and document lookup, so a
+#         model can answer questions about things it was not trained on.
+#         Drive it with `rag on` / `rag off`. Only useful with llama.cpp, since
+#         that is the engine which consumes MCP tools.
 #
 # Debian and Ubuntu are supported. Anything else is refused rather than
 # half-attempted, because the package names and the Vulkan setup differ.
@@ -30,6 +42,8 @@ LLM_DIR="${LLM_DIR:-$HOME/llm}"
 TTS_DIR="${TTS_DIR:-$HOME/tts}"
 WEBUI_DIR="${WEBUI_DIR:-$HOME/.openwebui}"
 WEBUI_VENV="${WEBUI_VENV:-$HOME/.venvs/openwebui}"
+RAG_DIR="${RAG_DIR:-$HOME/rag}"
+RAG_VENV="${RAG_VENV:-$HOME/.venvs/rag}"
 BINDIR="${BINDIR:-$HOME/.local/bin}"
 
 KOBOLDC_VER="${KOBOLDC_VER:-v1.122.1}"
@@ -43,7 +57,11 @@ TTS_MODELS=(
     "qwen3-tts-tokenizer-q8_0.gguf"
 )
 
-WANT_LLM="" ; WANT_TTS="" ; WANT_WEBUI="" ; ASSUME_YES=0 ; FORCE=0
+WANT_LLM="" ; WANT_TTS="" ; WANT_WEBUI="" ; WANT_RAG="" ; ASSUME_YES=0 ; FORCE=0
+
+# Which LLM engine(s) to install: ollama, llamacpp, or both. The switch then
+# chooses between installed engines with LLM_ENGINE.
+LLM_CHOICE=""
 
 # Share the config and helpers with the switch, so the installer and `llm`
 # cannot drift apart on model name, port, or how the CLI is invoked.
@@ -73,12 +91,52 @@ ask_yn() { # prompt default(y/n)
     case "$reply" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
+# Numbered menu. Sets CHOICE to the 1-based index selected.
+#
+# `--yes` takes the default rather than asking, so an unattended run still gets a
+# coherent answer instead of an empty variable.
+CHOICE=""
+ask_choice() { # prompt default_index option...
+    local prompt="$1" default="$2"; shift 2
+    local opts=("$@") reply i
+
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        printf '  %s [auto: %s]\n' "$prompt" "${opts[$((default - 1))]}"
+        CHOICE="$default"
+        return 0
+    fi
+
+    printf '  %s\n' "$prompt"
+    for i in "${!opts[@]}"; do
+        if [ "$((i + 1))" -eq "$default" ]; then
+            printf '    %d) %s  (default)\n' "$((i + 1))" "${opts[$i]}"
+        else
+            printf '    %d) %s\n' "$((i + 1))" "${opts[$i]}"
+        fi
+    done
+    printf '  choice [%d] ' "$default"
+    read -r reply || reply=""
+    reply="${reply:-$default}"
+
+    case "$reply" in
+        ''|*[!0-9]*)          CHOICE="$default" ;;
+        *) if [ "$reply" -ge 1 ] && [ "$reply" -le "${#opts[@]}" ]; then
+               CHOICE="$reply"
+           else
+               CHOICE="$default"
+           fi ;;
+    esac
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --yes|-y)    ASSUME_YES=1 ;;
         --llm-only)  WANT_LLM=1; WANT_TTS=0 ;;
         --tts-only)  WANT_LLM=0; WANT_TTS=1 ;;
         --webui-only) WANT_LLM=0; WANT_TTS=0; WANT_WEBUI=1 ;;
+        --llamacpp-only) WANT_LLM=1; LLM_CHOICE=llamacpp
+                         WANT_TTS=0; WANT_WEBUI=0; WANT_RAG=1 ;;
+        --rag-only)  WANT_LLM=0; WANT_TTS=0; WANT_WEBUI=0; WANT_RAG=1 ;;
         --force)     FORCE=1 ;;
         -h|--help)   sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; exit 0 ;;
         *)           die "unknown option: $1 (try --help)" ;;
@@ -240,6 +298,167 @@ for m in d.get("models", []):
     fi
 }
 
+# --------------------------------------------------------------- llama.cpp ----
+# The Vulkan loader is what the prebuilt binary links against. The drivers are
+# usually already present (Debian ships Mesa), so this matters only on a minimal
+# install — but a missing loader fails at run time with "cannot open shared
+# object", which reads as a broken download rather than a missing package.
+need_vulkan() {
+    ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' && return 0
+    apt_install libvulkan1
+}
+
+# Where the tarball's tag-named directory landed, or empty.
+llamacpp_bin_installed() {
+    find "$LLAMACPP_DIR" -maxdepth 3 -type f -name 'llama-server' 2>/dev/null | head -1
+}
+
+install_llamacpp() {
+    step "llama.cpp (LLM runtime and llama.ui)"
+
+    mkdir -p "$LLAMACPP_DIR" "$LLM_DIR/logs"
+
+    need_pkg curl curl
+    need_pkg tar tar
+    need_pkg python3 python3
+
+    local bin; bin="$(llamacpp_bin_installed)"
+    if [ -n "$bin" ] && [ -x "$bin" ] && [ "$FORCE" -ne 1 ]; then
+        ok "already installed: $("$bin" --version 2>&1 | grep -E '^version:' | head -1)"
+    else
+        # The version tags carry no binaries; they live on the nightly tag, and
+        # this one-line asset names it. Pinning a version here would rot.
+        local tag
+        tag="$(curl -fsSL \
+               https://github.com/ggml-org/llama.cpp/releases/latest/download/nightly-tag.txt \
+               | tr -d '[:space:]')"
+        [ -n "$tag" ] || die "could not resolve the llama.cpp nightly tag"
+
+        # The Vulkan build, not ROCm: the RX 6600 is gfx1032, which ROCm does not
+        # support. It is also 30 MB against 234 MB for a tarball that would not
+        # run here.
+        local url="https://github.com/ggml-org/llama.cpp/releases/download/${tag}/llama-${tag}-bin-ubuntu-vulkan-x64.tar.gz"
+        info "downloading llama.cpp $tag (Vulkan build, about 30 MB)"
+        curl -fL --retry 3 --retry-delay 3 -o /tmp/llama-vulkan.tar.gz "$url"
+
+        # Clear previous tag directories so two versions cannot both be found.
+        # The models directory is untouched.
+        rm -rf "$LLAMACPP_DIR"/llama-*
+        tar -xzf /tmp/llama-vulkan.tar.gz -C "$LLAMACPP_DIR"
+        rm -f /tmp/llama-vulkan.tar.gz
+
+        bin="$(llamacpp_bin_installed)"
+        [ -n "$bin" ] || die "no llama-server after extraction"
+        ok "installed $tag"
+    fi
+
+    need_vulkan
+    info "Vulkan loader present"
+    info "the same process serves the llama.ui chat page — there is no second service"
+}
+
+# Fetch the GGUF. The repository is derived from the configured filename, so
+# pointing LLM_GGUF at another quant works without touching this script.
+pull_gguf() {
+    local name; name="$(basename "$LLM_GGUF")"
+    step "Model: $name"
+
+    mkdir -p "$(dirname "$LLM_GGUF")"
+
+    if [ -f "$LLM_GGUF" ]; then
+        if [ "$FORCE" -ne 1 ]; then
+            ok "already present ($(du -h "$LLM_GGUF" | cut -f1))"
+            return 0
+        fi
+        rm -f "$LLM_GGUF"
+    fi
+
+    need_pkg curl curl
+
+    local url="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/${name}"
+    info "downloading $name — about 5.7 GB"
+    # -C - resumes a partial file. A 5.7 GB download that dies at 90% should not
+    # begin again from zero.
+    curl -fL --retry 3 --retry-delay 5 -C - -o "$LLM_GGUF" "$url" \
+        || die "could not download $url"
+    ok "downloaded $name ($(du -h "$LLM_GGUF" | cut -f1))"
+}
+
+verify_llamacpp() {
+    step "Verifying llama.cpp"
+
+    local bin; bin="$(llamacpp_bin_installed)"
+    [ -x "$bin" ] || die "llama-server is missing"
+
+    # A 5.3 GB model on an 8 GB card. Starting a second copy while one is already
+    # resident does not merely waste time: it evicts the running one and leaves
+    # both unusable. Report what is already there instead.
+    if pgrep -x llama-server >/dev/null 2>&1; then
+        local mem; mem="$(llm_gpu_mem || true)"
+        ok "a llama-server is already running${mem:+ ($mem)}"
+        info "skipping the load test rather than starting a second copy of the model"
+        return 0
+    fi
+
+    # A scratch port, deliberately not LLM_PORT. At this point the config may
+    # still name the other engine's port, and verification must not collide with
+    # it or with a server started by hand.
+    local port=8199
+    local log="$LLM_DIR/logs/llamacpp-verify.log"
+    : > "$log"
+
+    info "loading the model to confirm the GPU offload (this takes a moment)"
+    "$bin" -m "$LLM_GGUF" -ngl "$LLM_NGL" -c "$LLM_CTX" \
+        --host 127.0.0.1 --port "$port" >>"$log" 2>&1 &
+    local pid=$!
+
+    # The child must not survive this function, whatever happens inside it.
+    #
+    # This is not hypothetical: an earlier version let a failing command
+    # substitution abort the installer under `set -e` before the cleanup line,
+    # and the load-test server was left holding 6 GB of the card. A RETURN trap
+    # runs on every exit path, including that one.
+    # shellcheck disable=SC2064
+    trap "kill $pid 2>/dev/null || true" RETURN INT TERM
+
+    local ready=0 i
+    for i in $(seq 1 240); do
+        if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$port/health" 2>/dev/null; then
+            ready=1; break
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+
+    # The VRAM the driver reports against the size of the model file. This is the
+    # same measure `llm status` uses, and it is read rather than inferred from
+    # -ngl, which is a request and not a result.
+    local proc=""
+    if [ "$ready" -eq 1 ]; then
+        sleep 2                     # let the upload settle before measuring
+        proc="$(LLM_ENGINE=llamacpp llm_processor || true)"
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    for i in $(seq 1 25); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    trap - RETURN INT TERM
+
+    if [ "$ready" -ne 1 ]; then
+        warn "the server did not come up; see $log"
+    elif [ "$proc" = "100% GPU" ]; then
+        ok "loaded 100% on the GPU"
+    elif [ -n "$proc" ]; then
+        warn "loaded $proc — not fully on the GPU"
+        warn "lower LLM_CTX, or accept a slower model."
+    else
+        warn "the server came up but the GPU offload could not be measured; see $log"
+    fi
+}
+
 # ------------------------------------------------------------------- TTS ----
 install_tts() {
     step "TTS engine and weights"
@@ -317,18 +536,23 @@ install_tts_config() {
 
 
 # ----------------------------------------------------------------- chat UI --
-install_chat_ui() {
-    step "Chat UI (Open WebUI)"
-
-    # Open WebUI requires Python <3.13 and Debian 13 ships 3.13, so a managed
-    # interpreter is needed. uv fetches one without root.
+# uv is used to obtain a Python the distribution does not ship. Debian 13 has
+# 3.13 and Open WebUI needs <3.13, so a managed interpreter is required; it is
+# also what builds the RAG virtualenv. Installed user-locally, no root.
+ensure_uv() {
     if ! command -v uv >/dev/null 2>&1 && [ ! -x "$BINDIR/uv" ]; then
-        info "installing uv (to obtain Python 3.12; Open WebUI needs <3.13)"
+        info "installing uv (to obtain a managed Python interpreter)"
         need_pkg curl curl
         curl -LsSf https://astral.sh/uv/install.sh | sh
     fi
     export PATH="$BINDIR:$PATH"
     command -v uv >/dev/null 2>&1 || die "uv is still not on PATH; check $BINDIR"
+}
+
+install_chat_ui() {
+    step "Chat UI (Open WebUI)"
+
+    ensure_uv
 
     if [ -x "$WEBUI_VENV/bin/open-webui" ] && [ "$FORCE" -ne 1 ]; then
         ok "already installed at $WEBUI_VENV"
@@ -355,7 +579,65 @@ install_chat_ui() {
     ok "installed Open WebUI"
 }
 
+# ---------------------------------------------------------------------- RAG --
+install_rag() {
+    step "Lightweight RAG (web search and document lookup)"
+
+    mkdir -p "$RAG_DIR/logs" "$RAG_DIR/docs"
+
+    ensure_uv
+
+    if [ -x "$RAG_VENV/bin/python" ] && [ "$FORCE" -ne 1 ]; then
+        ok "already installed at $RAG_VENV"
+    else
+        # Everything here except the MCP protocol itself is Python's standard
+        # library, so this virtualenv is ~37 MB against Open WebUI's ~2.5 GB.
+        # No torch, no embedding model, no vector database: ranking is BM25, which
+        # is arithmetic. That is the whole point of calling it lightweight.
+        info "creating a virtualenv (Python 3.12)"
+        uv venv "$RAG_VENV" --python 3.12
+        info "installing the MCP server package"
+        uv pip install --python "$RAG_VENV/bin/python" mcp
+        ok "installed the RAG service"
+    fi
+
+    if [ ! -f "$RAG_DIR/config.env" ]; then
+        cp "$REPO_DIR/src/rag.env.example" "$RAG_DIR/config.env"
+        ok "wrote $RAG_DIR/config.env"
+    fi
+}
+
 # --------------------------------------------------------------- switch -----
+# Set a ${VAR:=value} line in the model config, in place, or append it.
+#
+# Done in Python rather than sed because the values here are paths, and a path
+# containing the sed delimiter would otherwise silently corrupt the file.
+set_config_var() { # VAR VALUE
+    local var="$1" value="$2" cfg="$LLM_DIR/config.env"
+    mkdir -p "$LLM_DIR"
+    [ -f "$cfg" ] || cp "$REPO_DIR/config.env.example" "$cfg"
+
+    python3 - "$cfg" "$var" "$value" <<'PY'
+import re, sys
+path, var, value = sys.argv[1], sys.argv[2], sys.argv[3]
+new = ': "${%s:=%s}"\n' % (var, value)
+pat = re.compile(r'^\s*(#\s*)?(:\s+)?"\$\{%s:=' % re.escape(var))
+out, done = [], False
+for line in open(path):
+    if pat.match(line):
+        if not done:          # replace the first, drop any duplicates
+            out.append(new)
+            done = True
+    else:
+        out.append(line)
+if not done:
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    out.append("\n" + new)
+open(path, "w").writelines(out)
+PY
+}
+
 install_switches() {
     step "Commands"
     mkdir -p "$BINDIR"
@@ -371,12 +653,21 @@ install_switches() {
             info "removed stale $LLM_DIR/$f"
         fi
     done
-    [ -d "$LLM_DIR/llama" ] && \
-        info "note: $LLM_DIR/llama holds the old llama.cpp build; remove it by hand if you no longer want it"
 
     chmod +x "$REPO_DIR/src/llm" "$REPO_DIR/src/ask.sh" "$REPO_DIR/src/bench.sh"
     ln -sfn "$REPO_DIR/src/llm" "$BINDIR/llm"
     ok "linked $BINDIR/llm"
+
+    if [ "$WANT_RAG" = 1 ]; then
+        chmod +x "$REPO_DIR/src/rag"
+        ln -sfn "$REPO_DIR/src/rag" "$BINDIR/rag"
+        ok "linked $BINDIR/rag"
+        mkdir -p "$RAG_DIR"
+        if [ ! -f "$RAG_DIR/config.env" ]; then
+            cp "$REPO_DIR/src/rag.env.example" "$RAG_DIR/config.env"
+            ok "wrote $RAG_DIR/config.env"
+        fi
+    fi
 
     if [ -n "$WANT_WEBUI" ] && [ "$WANT_WEBUI" = 1 ]; then
         chmod +x "$REPO_DIR/src/webui"
@@ -407,24 +698,100 @@ install_switches() {
         warn "moved the old llama.cpp config to $LLM_DIR/config.env.pre-ollama"
     fi
 
+    # The Ollama-only version pinned LLM_PORT=11434 here. Now that each engine has
+    # its own default, that pin would put llama.cpp on Ollama's port and make
+    # `llm status` misleading about which engine is running. Comment it out and
+    # keep the original text, so nothing is lost if you want it back.
+    if [ -f "$LLM_DIR/config.env" ] && \
+       grep -qE '^[[:space:]]*:[[:space:]]*"\$\{LLM_PORT:=' "$LLM_DIR/config.env"; then
+        cp "$LLM_DIR/config.env" "$LLM_DIR/config.env.pre-engines"
+        sed -i -E \
+            's|^([[:space:]]*):[[:space:]]*"\$\{LLM_PORT:=([0-9]+)\}"|# unpinned by the installer: each engine now has its own port default\n#\1: "${LLM_PORT:=\2}"|' \
+            "$LLM_DIR/config.env"
+        info "unpinned LLM_PORT (ollama and llama.cpp now get their own ports)"
+        info "previous file kept at $LLM_DIR/config.env.pre-engines"
+    fi
+
     if [ ! -f "$LLM_DIR/config.env" ] && [ -f "$REPO_DIR/config.env.example" ]; then
         cp "$REPO_DIR/config.env.example" "$LLM_DIR/config.env"
         ok "wrote $LLM_DIR/config.env"
     fi
+
+    # Record the engine actually chosen. Without this, picking llama.cpp in the
+    # menu would install it and still leave `llm on` starting Ollama — the switch
+    # would report a healthy server that is not the one you asked for.
+    if [ "$WANT_LLM" = 1 ] && [ -n "$LLM_CHOICE" ]; then
+        local engine
+        case "$LLM_CHOICE" in
+            ollama)   engine=ollama ;;
+            llamacpp) engine=llamacpp ;;
+            both)     engine=llamacpp ;;   # the engine you just added becomes active
+            *)        engine=ollama ;;
+        esac
+        set_config_var LLM_ENGINE "$engine"
+        ok "LLM_ENGINE=$engine in $LLM_DIR/config.env"
+    fi
 }
 
 # ------------------------------------------------------------------ main ----
-[ -n "$WANT_LLM" ] || [ -n "$WANT_TTS" ] || {
+if [ -z "$WANT_LLM$WANT_TTS$WANT_WEBUI$WANT_RAG" ]; then
     echo
     echo "  What would you like to install?"
-    ask_yn "LLM — qwen3.5:9b on Ollama?" y && WANT_LLM=1 || WANT_LLM=0
+    ask_choice "LLM engine?" 3 \
+        "Ollama only     — model referenced by tag; reuse an existing install" \
+        "llama.cpp only  — GGUF model, with the llama.ui chat page built in" \
+        "Both            — install each; starts on llama.cpp (~12 GB of models)"
+    case "$CHOICE" in
+        1) LLM_CHOICE=ollama ;;
+        2) LLM_CHOICE=llamacpp ;;
+        *) LLM_CHOICE=both ;;
+    esac
+    WANT_LLM=1
+
     ask_yn "TTS — the voice-cloning server?" y && WANT_TTS=1 || WANT_TTS=0
     ask_yn "Chat UI — Open WebUI on top of the model?" y && WANT_WEBUI=1 || WANT_WEBUI=0
-}
 
-[ "$WANT_LLM" = 1 ] && { install_ollama; pull_model; verify_llm; }
+    # Only worth asking when llama.cpp is in play: it is the engine that consumes
+    # MCP tools. Offering it against Ollama would install something the model
+    # could not reach.
+    if [ "$LLM_CHOICE" != "ollama" ]; then
+        ask_yn "RAG — web search and document lookup for the model?" y \
+            && WANT_RAG=1 || WANT_RAG=0
+    fi
+fi
+
+# A flag-only run (--llm-only) never went through the menu, so pick the default.
+[ -z "$LLM_CHOICE" ] && LLM_CHOICE=both
+
+case "$LLM_CHOICE" in
+    ollama)   ENGINES=ollama ;;
+    llamacpp) ENGINES=llamacpp ;;
+    both)     ENGINES="ollama llamacpp" ;;
+    *)        die "unknown engine choice '$LLM_CHOICE'" ;;
+esac
+
+if [ "$WANT_LLM" = 1 ]; then
+    # Install in a fixed order rather than the menu's, so the output reads the
+    # same however you got here.
+    case " $ENGINES " in
+        *" ollama "*)
+            install_ollama
+            pull_model
+            verify_llm
+            ;;
+    esac
+    case " $ENGINES " in
+        *" llamacpp "*)
+            install_llamacpp
+            pull_gguf
+            verify_llamacpp
+            ;;
+    esac
+fi
+
 [ "$WANT_TTS" = 1 ] && { install_tts; build_tts; install_tts_config; }
 [ "$WANT_WEBUI" = 1 ] && install_chat_ui
+[ "$WANT_RAG" = 1 ] && install_rag
 install_switches
 
 step "Done"
@@ -433,16 +800,44 @@ cat <<EOF
   Nothing is running and nothing will start on its own.
 
     llm on          start the LLM and load the model
-    llm status      state, model, where it loaded, context
+    llm status      state, engine, model, where it loaded, context
+    llm ui          the chat UI address, when the engine has one
     ./src/ask.sh "hello"        one-shot prompt
 
     tts on          start the TTS server and web UI
     tts status      state, backend, voices
     tts say "hello" -o out.wav
 
-    webui on        the chat interface, on top of Ollama
-    webui status    state, plus whether Ollama and TTS are reachable
+    webui on        Open WebUI, on top of the model
+    webui status    state, plus whether the model and TTS are reachable
 
-  Models live in $LLM_DIR (config) and $TTS_DIR (weights, voices, logs).
+  Models and config live in $LLM_DIR.
+  TTS weights and voices live in $TTS_DIR.
   Neither directory is in git.
 EOF
+
+if [ "$WANT_RAG" = 1 ]; then
+cat <<EOF
+
+  RAG — retrieval for the model:
+
+    rag on          attach it to the model, and restart the model
+    rag off         detach it
+    rag test        exercise search, fetch and ranking
+    rag status      installed, attached, and what it can see
+
+  llama.cpp spawns the retrieval server itself when a tool is called, so there is
+  no service to run and nothing to keep alive. Drop files into
+  $RAG_DIR/docs to make them searchable as well.
+EOF
+fi
+
+if [ "$WANT_LLM" = 1 ] && [ "$LLM_CHOICE" = "both" ]; then
+cat <<EOF
+
+  Two engines are installed, and llama.cpp is the active one. To go back to
+  Ollama, edit LLM_ENGINE in $LLM_DIR/config.env, or for one run:
+
+    LLM_ENGINE=ollama llm on
+EOF
+fi

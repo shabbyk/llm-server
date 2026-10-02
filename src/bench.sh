@@ -10,6 +10,10 @@
 # llama.cpp build, where `llama-bench` reported 36.4 tok/s for Q4_K_M against a
 # real 21.3, because it spreads a fixed warmup cost over very few tokens.
 #
+# Works against either engine, picking the API each one actually implements.
+# Every run gets a unique prompt prefix, so prompt caching cannot make prefill
+# look faster than it is.
+#
 # Decode (tokens out per second) is the number you feel. Prefill (prompt tokens
 # per second) is what long agentic system prompts pay.
 
@@ -41,25 +45,62 @@ PY
 PROMPT="$PROMPT Reply with only the word: done"
 
 echo "  model:  $LLM_MODEL"
+echo "  engine: $LLM_ENGINE"
 echo "  url:    $(llm_url)"
 echo "  prompt: ~$WORDS words"
 echo
 
-python3 - "$LLM_HOST" "$LLM_PORT" "$LLM_MODEL" "$RUNS" "$PROMPT" <<'PY'
+python3 - "$LLM_HOST" "$LLM_PORT" "$LLM_MODEL" "$LLM_ENGINE" "$RUNS" "$PROMPT" <<'PY'
 import json, sys, time, urllib.request
 
-host, port, model, runs, prompt = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
-url = f"http://{host}:{port}/api/generate"
+host, port, model, engine, runs, prompt = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6])
+
+# Each engine has its own API, and its own idea of what timing looks like.
+if engine == "llamacpp":
+    url = f"http://{host}:{port}/completion"
+
+    def payload(seed):
+        return {"prompt": seed + prompt, "n_predict": 32, "temperature": 0,
+                "stream": False,
+                # Otherwise runs 2..n reuse the cached prefix and prefill collapses
+                # to near zero, which flatters the engine instead of measuring it.
+                "cache_prompt": False}
+
+    def timings(d):
+        t = d.get("timings") or {}
+        in_n = int(t.get("prompt_n") or 0)
+        out_n = int(t.get("predicted_n") or 0)
+        p = float(t.get("prompt_per_second") or 0)
+        e = float(t.get("predicted_per_second") or 0)
+        if not p and t.get("prompt_ms"):
+            p = in_n / (float(t["prompt_ms"]) / 1000)
+        if not e and t.get("predicted_ms"):
+            e = out_n / (float(t["predicted_ms"]) / 1000)
+        return in_n, out_n, p, e
+else:
+    url = f"http://{host}:{port}/api/generate"
+
+    def payload(seed):
+        return {"model": model, "prompt": seed + prompt, "stream": False,
+                "options": {"num_predict": 32, "temperature": 0}}
+
+    def timings(d):
+        in_n = int(d.get("prompt_eval_count") or 0)
+        in_ns = int(d.get("prompt_eval_duration") or 0)
+        out_n = int(d.get("eval_count") or 0)
+        out_ns = int(d.get("eval_duration") or 0)
+        return (in_n, out_n,
+                in_n / (in_ns / 1e9) if in_ns else 0.0,
+                out_n / (out_ns / 1e9) if out_ns else 0.0)
 
 pre, dec = [], []
 for i in range(runs + 1):
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"num_predict": 32, "temperature": 0},
-    }
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+    # A unique prefix per run, so prompt caching cannot hide the prefill cost.
+    # The nonce goes at the front: caching is by prefix, so a suffix change would
+    # still let the shared beginning be skipped.
+    seed = f"[run {i}, nonce {time.time_ns()}]\n"
+    req = urllib.request.Request(url, data=json.dumps(payload(seed)).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=900) as r:
@@ -73,13 +114,10 @@ for i in range(runs + 1):
         print(f"  warmup: prefill paid the load cost, discarded ({wall:.2f}s)")
         continue
 
-    pc, pns = d.get("prompt_eval_count", 0), d.get("prompt_eval_duration", 0)
-    ec, ens = d.get("eval_count", 0), d.get("eval_duration", 0)
-    p = pc / (pns / 1e9) if pns else 0
-    e = ec / (ens / 1e9) if ens else 0
+    in_n, out_n, p, e = timings(d)
     pre.append(p); dec.append(e)
     print(f"  run {i}: prefill {p:6.0f} tok/s   decode {e:5.1f} tok/s   "
-          f"wall {wall:5.2f}s   ({pc} in / {ec} out)")
+          f"wall {wall:5.2f}s   ({in_n} in / {out_n} out)")
 
 if pre and dec:
     print()
