@@ -108,6 +108,20 @@ need_pkg() { # command package...
     apt_install "$pkg"
 }
 
+# The version string, without the noise.
+#
+# `ollama --version` writes "Warning: could not connect to a running Ollama
+# instance" to STDOUT when no server is up — which is precisely the state we are
+# in during installation. Taking `head -1` of that yields the warning instead of
+# the version, so filter warnings out and accept that there may be nothing left.
+#
+# The `|| true` matters: under `set -o pipefail` a `grep` that matches nothing
+# fails the whole pipeline, and `set -e` would then abort the installer on the
+# ordinary "no server running" case.
+ollama_version() {
+    "$BINDIR/ollama" --version 2>/dev/null | grep -v '^Warning:' | head -1 || true
+}
+
 printf '%s\n' "  ${B}Local AI stack installer${N}"
 printf '  %s\n' "$PRETTY_NAME"
 printf '  repo: %s\n' "$REPO_DIR"
@@ -119,7 +133,9 @@ install_ollama() {
     mkdir -p "$BINDIR" "$LLM_DIR/logs"
 
     if [ -x "$BINDIR/ollama" ] && [ "$FORCE" -ne 1 ]; then
-        ok "already installed: $("$BINDIR/ollama" --version 2>/dev/null | head -1 || echo present)"
+        local v
+        v="$(ollama_version)"
+        ok "already installed: ${v:-ollama is present}"
         return 0
     fi
 
@@ -145,7 +161,7 @@ install_ollama() {
     rm -f /tmp/ollama.tar.zst
 
     [ -x "$BINDIR/ollama" ] || die "expected $BINDIR/ollama after extraction"
-    ok "installed $("$BINDIR/ollama" --version 2>/dev/null | head -1)"
+    ok "installed ollama $tag"
 
     # Note carefully what is NOT done here: no systemd unit, no /etc, no root.
     info "no systemd unit created — nothing will start on boot"
