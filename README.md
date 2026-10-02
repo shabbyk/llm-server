@@ -20,6 +20,7 @@ Two independent pieces. Installing one does not require the other:
 |---|---|---|---|
 | **LLM** | Ollama, user-local | OpenAI-compatible API on 11434 | `llm` |
 | **TTS** | KoboldCpp + a Rust wrapper | web UI on 8081, OpenAI-shaped audio API | `tts` |
+| **Chat UI** | Open WebUI | chat interface on 8080 | `webui` |
 
 ## Install
 
@@ -35,6 +36,7 @@ It asks two questions —
 ```
   LLM — qwen3.5:9b on Ollama? [Y/n]
   TTS — the voice-cloning server? [Y/n]
+  Chat UI — Open WebUI on top of the model? [Y/n]
 ```
 
 — then does the rest: installs Ollama, pulls the model, installs a C and Rust
@@ -152,6 +154,73 @@ KoboldCpp forwards only the audio, so it runs in `x_vector_only_mode`
 permanently. It is good, not perfect, and no amount of clip tuning lifts that
 ceiling.
 
+## Chat UI
+
+```sh
+llm on                # the model must be up first
+webui on              # then the interface
+webui status          # state, and whether Ollama and TTS are reachable
+webui off
+```
+
+Then open <http://localhost:8080/>. **The first account to sign up becomes
+admin** — Open WebUI has its own login and does not ship with one.
+
+`webui on` reports whether the things it needs are running, because a chat UI
+with no model behind it just shows an empty model list and looks broken:
+
+```
+  starting Open WebUI on 0.0.0.0:8080 ready
+  url:    http://192.168.0.101:8080/
+  ollama: reachable at http://127.0.0.1:11434
+  tts:    not running (optional; 'tts on' enables speech output)
+```
+
+### It costs 2.5 GB, not 7.2
+
+`open-webui` has 104 dependencies, and the bulk is not Open WebUI. `torch`
+arrives transitively through `sentence-transformers` (for RAG embeddings), and
+the default wheel bundles ~4.5 GB of NVIDIA CUDA libraries — `nvidia-*` and
+`triton` — which cannot run on this machine's AMD card.
+
+The installer installs the **CPU-only torch** first, so the resolver sees it
+satisfied and never pulls them:
+
+| | |
+|---|---|
+| venv before | 7.2 GB |
+| **venv now** | **2.5 GB** |
+| `nvidia-*`, `triton` | absent |
+| torch | `2.14.1+cpu`, `CUDA available: False` |
+
+The library is identical; only the GPU backends differ, and they were never
+usable here. Your chat model still runs entirely on the GPU through Ollama —
+the CPU work is just document embedding, on a model of tens of megabytes.
+
+### Speech output
+
+`webui on` wires it to the TTS server automatically, so answered text can be
+read aloud in a cloned voice. Set `AUDIO_TTS_VOICE` in
+`~/.openwebui/config.env` to any name from `tts voices`. This works because the
+TTS server speaks OpenAI's audio API directly — no adapter.
+
+### Web search is off, and needs a backend
+
+Open WebUI **does not include web search**. It calls out to something you
+supply, so enabling it means running a second service or handing over an API
+key. It is left off until you choose:
+
+```sh
+# ~/.openwebui/config.env — self-hosted, no external dependency
+ENABLE_RAG_WEB_SEARCH=true
+RAG_WEB_SEARCH_ENGINE=searxng
+SEARXNG_QUERY_URL=http://127.0.0.1:8888/search?q=<query>
+```
+
+Or `RAG_WEB_SEARCH_ENGINE=brave` with `BRAVE_SEARCH_API_KEY`. Then
+`webui restart`. Everything in that file is exported to the server, so any
+Open WebUI setting can go there.
+
 ## Security
 
 Neither service has authentication.
@@ -161,6 +230,9 @@ Neither service has authentication.
   route here gets the model with no key.
 - **TTS UI** binds `0.0.0.0` and can write files and restart its server. Set
   `TTS_WEBUI_HOST=127.0.0.1` in `~/tts/config.env` for tunnel-only.
+- **Chat UI** binds `0.0.0.0` and has its own login — the first sign-up becomes
+  admin, so sign up before exposing the port. Set `WEBUI_HOST=127.0.0.1` in
+  `~/.openwebui/config.env` for tunnel-only.
 
 Both defaults are chosen so the *unsafe* option is the one you have to ask for.
 
@@ -173,6 +245,8 @@ src/common.sh           shared config and helpers
 src/llm                 the LLM switch
 src/ask.sh ask.py       one-shot prompt client (thinking off by default)
 src/bench.sh            prefill/decode measurement
+src/webui               the chat UI switch
+src/webui.env.example   its settings, including the search opt-in
 tts/                    the TTS wrapper: one Rust binary
 ```
 
@@ -184,6 +258,8 @@ Source lives here. Runtime state does not:
 | `~/.ollama/` | model blobs |
 | `~/.local/{bin,lib}/ollama` | the Ollama runtime |
 | `~/tts/` | engine, weights, voices, logs |
+| `~/.openwebui/` | the chat UI's database, uploads, settings |
+| `~/.venvs/openwebui/` | its Python environment |
 
 `~/llm/llama/` is the previous llama.cpp build. The installer does not remove it;
 delete it by hand once you are satisfied with Ollama.

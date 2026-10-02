@@ -5,6 +5,7 @@
 #   ./install.sh --yes        # install everything, no questions
 #   ./install.sh --llm-only
 #   ./install.sh --tts-only
+#   ./install.sh --webui-only
 #   ./install.sh --force      # reinstall things that are already present
 #
 # Two independent pieces:
@@ -27,6 +28,8 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 OLLAMA_VERSION="${OLLAMA_VERSION:-latest}"
 LLM_DIR="${LLM_DIR:-$HOME/llm}"
 TTS_DIR="${TTS_DIR:-$HOME/tts}"
+WEBUI_DIR="${WEBUI_DIR:-$HOME/.openwebui}"
+WEBUI_VENV="${WEBUI_VENV:-$HOME/.venvs/openwebui}"
 BINDIR="${BINDIR:-$HOME/.local/bin}"
 
 KOBOLDC_VER="${KOBOLDC_VER:-v1.122.1}"
@@ -40,7 +43,7 @@ TTS_MODELS=(
     "qwen3-tts-tokenizer-q8_0.gguf"
 )
 
-WANT_LLM="" ; WANT_TTS="" ; ASSUME_YES=0 ; FORCE=0
+WANT_LLM="" ; WANT_TTS="" ; WANT_WEBUI="" ; ASSUME_YES=0 ; FORCE=0
 
 # Share the config and helpers with the switch, so the installer and `llm`
 # cannot drift apart on model name, port, or how the CLI is invoked.
@@ -75,6 +78,7 @@ while [ $# -gt 0 ]; do
         --yes|-y)    ASSUME_YES=1 ;;
         --llm-only)  WANT_LLM=1; WANT_TTS=0 ;;
         --tts-only)  WANT_LLM=0; WANT_TTS=1 ;;
+        --webui-only) WANT_LLM=0; WANT_TTS=0; WANT_WEBUI=1 ;;
         --force)     FORCE=1 ;;
         -h|--help)   sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; exit 0 ;;
         *)           die "unknown option: $1 (try --help)" ;;
@@ -311,6 +315,46 @@ install_tts_config() {
     fi
 }
 
+
+# ----------------------------------------------------------------- chat UI --
+install_chat_ui() {
+    step "Chat UI (Open WebUI)"
+
+    # Open WebUI requires Python <3.13 and Debian 13 ships 3.13, so a managed
+    # interpreter is needed. uv fetches one without root.
+    if ! command -v uv >/dev/null 2>&1 && [ ! -x "$BINDIR/uv" ]; then
+        info "installing uv (to obtain Python 3.12; Open WebUI needs <3.13)"
+        need_pkg curl curl
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    fi
+    export PATH="$BINDIR:$PATH"
+    command -v uv >/dev/null 2>&1 || die "uv is still not on PATH; check $BINDIR"
+
+    if [ -x "$WEBUI_VENV/bin/open-webui" ] && [ "$FORCE" -ne 1 ]; then
+        ok "already installed at $WEBUI_VENV"
+        return 0
+    fi
+
+    info "creating a virtualenv (Python 3.12)"
+    uv venv "$WEBUI_VENV" --python 3.12
+
+    # CPU-only torch FIRST, and the ordering matters.
+    #
+    # torch arrives transitively through sentence-transformers (Open WebUI's
+    # RAG embeddings). The default wheel bundles ~4.5 GB of NVIDIA CUDA
+    # libraries -- nvidia-*, triton -- that cannot run on this machine's AMD
+    # card. Installing the CPU build first means the resolver sees torch
+    # already satisfied and never pulls them. Measured: 7.2 GB before, ~2.5 GB
+    # after. The library is identical; only the GPU backends differ.
+    info "installing CPU-only torch (avoids ~4.5 GB of unusable CUDA libraries)"
+    uv pip install --python "$WEBUI_VENV/bin/python" torch \
+        --index-url https://download.pytorch.org/whl/cpu
+
+    info "installing open-webui (about 100 packages, a few minutes)"
+    uv pip install --python "$WEBUI_VENV/bin/python" open-webui
+    ok "installed Open WebUI"
+}
+
 # --------------------------------------------------------------- switch -----
 install_switches() {
     step "Commands"
@@ -333,6 +377,17 @@ install_switches() {
     chmod +x "$REPO_DIR/src/llm" "$REPO_DIR/src/ask.sh" "$REPO_DIR/src/bench.sh"
     ln -sfn "$REPO_DIR/src/llm" "$BINDIR/llm"
     ok "linked $BINDIR/llm"
+
+    if [ -n "$WANT_WEBUI" ] && [ "$WANT_WEBUI" = 1 ]; then
+        chmod +x "$REPO_DIR/src/webui"
+        ln -sfn "$REPO_DIR/src/webui" "$BINDIR/webui"
+        ok "linked $BINDIR/webui"
+        mkdir -p "$WEBUI_DIR"
+        if [ ! -f "$WEBUI_DIR/config.env" ]; then
+            cp "$REPO_DIR/src/webui.env.example" "$WEBUI_DIR/config.env"
+            ok "wrote $WEBUI_DIR/config.env"
+        fi
+    fi
 
     if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
         printf '\n# user-local binaries (llm / tts switches)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.bashrc"
@@ -364,10 +419,12 @@ install_switches() {
     echo "  What would you like to install?"
     ask_yn "LLM — qwen3.5:9b on Ollama?" y && WANT_LLM=1 || WANT_LLM=0
     ask_yn "TTS — the voice-cloning server?" y && WANT_TTS=1 || WANT_TTS=0
+    ask_yn "Chat UI — Open WebUI on top of the model?" y && WANT_WEBUI=1 || WANT_WEBUI=0
 }
 
 [ "$WANT_LLM" = 1 ] && { install_ollama; pull_model; verify_llm; }
 [ "$WANT_TTS" = 1 ] && { install_tts; build_tts; install_tts_config; }
+[ "$WANT_WEBUI" = 1 ] && install_chat_ui
 install_switches
 
 step "Done"
@@ -382,6 +439,9 @@ cat <<EOF
     tts on          start the TTS server and web UI
     tts status      state, backend, voices
     tts say "hello" -o out.wav
+
+    webui on        the chat interface, on top of Ollama
+    webui status    state, plus whether Ollama and TTS are reachable
 
   Models live in $LLM_DIR (config) and $TTS_DIR (weights, voices, logs).
   Neither directory is in git.

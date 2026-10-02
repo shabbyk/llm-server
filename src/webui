@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# On/off switch for the Open WebUI chat front end.
+#
+#   webui              # same as "webui status"
+#   webui on           # start, wait until it answers
+#   webui off          # stop
+#   webui toggle / restart
+#   webui status       # state, URL, whether Ollama is reachable
+#   webui url          # just the URL, for scripting
+#   webui log          # follow its log
+#   webui help
+#
+# Open WebUI is a front end only: it holds no model of its own. It talks to
+# Ollama on 11434 for chat, and (if configured) to the TTS server on 8081 for
+# speech. `webui on` does not start either of those — it tells you if they are
+# missing rather than pretending.
+#
+# Nothing here starts automatically, matching `llm` and `tts`.
+
+set -uo pipefail
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/common.sh"
+
+WEBUI_DIR="${WEBUI_DIR:-$HOME/.openwebui}"
+: "${WEBUI_PORT:=8080}"
+# Bound to the LAN by default, like the TTS UI, because the whole point is to
+# open it from a browser. It has its own login. Set 127.0.0.1 for tunnel-only.
+: "${WEBUI_HOST:=0.0.0.0}"
+WEBUI_VENV="${WEBUI_VENV:-$HOME/.venvs/openwebui}"
+WEBUI_PID="$WEBUI_DIR/webui.pid"
+WEBUI_LOG="$WEBUI_DIR/webui.log"
+
+# Persistent overrides live here. `set -a` exports everything this file sets,
+# so any Open WebUI setting can be added to it and will reach the server — that
+# is how optional features like web search get enabled without touching code.
+if [ -f "$WEBUI_DIR/config.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$WEBUI_DIR/config.env"
+    set +a
+fi
+
+die() { echo "webui: $*" >&2; exit 2; }
+
+webui_python() { printf '%s' "$WEBUI_VENV/bin/open-webui"; }
+
+webui_serving() {
+    curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:$WEBUI_PORT/" 2>/dev/null
+}
+
+webui_url() {
+    local ip
+    ip="$(llm_detect_host)"
+    [ "$WEBUI_HOST" = "127.0.0.1" ] && ip="127.0.0.1"
+    printf 'http://%s:%s/' "$ip" "$WEBUI_PORT"
+}
+
+start() {
+    [ -x "$(webui_python)" ] || {
+        die "Open WebUI is not installed at $WEBUI_VENV
+       Run: ./install.sh   (and choose the chat UI)"
+    }
+    mkdir -p "$WEBUI_DIR"
+
+    # Tell it where the model lives, and where speech comes from, at start time.
+    # These are read from the environment by Open WebUI on boot.
+    local ollama_url; ollama_url="$(llm_base)"
+    # Run from the data directory. Open WebUI writes some files relative to the
+    # process CWD -- its secret key among them -- so launching from the repo put
+    # .webui_secret_key in the working tree, where it very nearly got committed.
+    #
+    # `exec` so the pid we background is the server, not an intermediate shell.
+    ( cd "$WEBUI_DIR" && exec env \
+        OLLAMA_BASE_URL="$ollama_url" \
+        WEBUI_SECRET_KEY_FILE="$WEBUI_DIR/.webui_secret_key" \
+        AUDIO_TTS_OPENAI_API_BASE_URL="http://127.0.0.1:${TTS_WEBUI_PORT:-8081}/v1" \
+        AUDIO_TTS_OPENAI_API_KEY="not-needed" \
+        AUDIO_TTS_ENGINE="${AUDIO_TTS_ENGINE:-openai}" \
+        AUDIO_TTS_MODEL="${AUDIO_TTS_MODEL:-tts-1}" \
+        AUDIO_TTS_VOICE="${AUDIO_TTS_VOICE:-kobo}" \
+        DATA_DIR="$WEBUI_DIR/data" \
+        setsid "$(webui_python)" serve \
+            --host "$WEBUI_HOST" --port "$WEBUI_PORT" ) \
+        >>"$WEBUI_LOG" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+
+    local i
+    for i in $(seq 1 120); do
+        if webui_serving; then
+            pgrep -f "open-webui serve" 2>/dev/null | head -1 > "$WEBUI_PID"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+do_on() {
+    if webui_serving; then
+        echo "webui: already ON ($(webui_url))" >&2
+        return 1
+    fi
+
+    printf '  starting Open WebUI on %s:%s' "$WEBUI_HOST" "$WEBUI_PORT"
+    if ! start; then
+        printf ' FAILED\n'
+        echo "webui: it did not answer within 120s. Check $WEBUI_LOG" >&2
+        return 1
+    fi
+    printf ' ready\n'
+    echo "  url:    $(webui_url)"
+
+    # A front end with no model behind it is the confusing failure, so say so
+    # now rather than letting the UI show an empty model list later.
+    if llm_serving; then
+        echo "  ollama: reachable at $(llm_base)"
+    else
+        echo "  ollama: NOT running — start it with 'llm on', or the model list will be empty" >&2
+    fi
+    if curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:${TTS_WEBUI_PORT:-8081}/api/health" 2>/dev/null; then
+        echo "  tts:    reachable — speech output is available in the UI"
+    else
+        echo "  tts:    not running (optional; 'tts on' enables speech output)"
+    fi
+    echo "  login:  Open WebUI requires an account; the first sign-up becomes admin."
+}
+
+do_off() {
+    if ! webui_serving; then
+        echo "webui: already OFF"
+        return 0
+    fi
+    local pids
+    pids="$(pgrep -f 'open-webui serve' 2>/dev/null | tr '\n' ' ')"
+    if [ -n "$pids" ]; then
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null && echo "  stopped Open WebUI"
+    fi
+    rm -f "$WEBUI_PID"
+
+    local i
+    for i in $(seq 1 50); do
+        webui_serving || break
+        sleep 0.2
+    done
+    webui_serving && echo "webui: warning: still answering on $WEBUI_PORT" >&2
+    return 0
+}
+
+do_status() {
+    printf '  webui:    '
+    if [ -x "$(webui_python)" ]; then
+        "$WEBUI_VENV/bin/python" -c 'import importlib.metadata as m; print("open-webui", m.version("open-webui"))' 2>/dev/null || echo "installed"
+    else
+        echo "NOT INSTALLED (run ./install.sh and choose the chat UI)"
+    fi
+    printf '  server:   '
+    if webui_serving; then echo "ON   $(webui_url)"; else echo "OFF  (start with: webui on)"; fi
+    printf '  data:     %s\n' "$WEBUI_DIR"
+
+    printf '  ollama:   '
+    if llm_serving; then echo "reachable at $(llm_base)"; else echo "NOT running (llm on)"; fi
+    printf '  tts:      '
+    if curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:${TTS_WEBUI_PORT:-8081}/api/health" 2>/dev/null; then
+        echo "reachable on ${TTS_WEBUI_PORT:-8081}"
+    else
+        echo "not running (tts on)"
+    fi
+}
+
+usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//' -e '/^$/d'; }
+
+cmd="${1:-status}"
+case "$cmd" in
+    on|start|up)    do_on ;;
+    off|stop|down)  do_off ;;
+    toggle)         if webui_serving; then do_off; else do_on; fi ;;
+    restart)        do_off && do_on ;;
+    status|"")      do_status ;;
+    url)            webui_url; echo ;;
+    log)
+        [ -f "$WEBUI_LOG" ] || die "no log at $WEBUI_LOG yet"
+        exec tail -n 50 -f "$WEBUI_LOG" ;;
+    help|-h|--help) usage ;;
+    *)              die "unknown command '$cmd' (try: webui help)" ;;
+esac
