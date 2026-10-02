@@ -132,7 +132,31 @@ LLM_LOGS="${LLM_LOGS:-$LLM_DIR/logs}"
 LLM_PID="$LLM_LOGS/$LLM_ENGINE.pid"
 LLM_LOG="$LLM_LOGS/$LLM_ENGINE.log"
 
-llm_url() { printf 'http://%s:%s' "$LLM_HOST" "$LLM_PORT"; }
+# The address to *connect* to.
+#
+# 0.0.0.0 and :: are bind addresses meaning "every interface", not destinations;
+# handing one to a client means telling it to dial a wildcard. Linux happens to
+# resolve that to loopback, which is why the health checks passed, but that is a
+# convenience rather than something to rely on from every HTTP client.
+llm_connect_host() {
+    case "$LLM_HOST" in
+        0.0.0.0|::|"") printf '127.0.0.1' ;;
+        *)             printf '%s' "$LLM_HOST" ;;
+    esac
+}
+
+# The address to *show* someone. Same reasoning, opposite direction: a browser
+# cannot open http://0.0.0.0:8090/, so when bound to every interface the machine's
+# LAN address is the useful thing to print.
+llm_display_host() {
+    case "$LLM_HOST" in
+        0.0.0.0|::|"") llm_detect_host ;;
+        *)             printf '%s' "$LLM_HOST" ;;
+    esac
+}
+
+llm_url()         { printf 'http://%s:%s' "$(llm_connect_host)" "$LLM_PORT"; }
+llm_display_url() { printf 'http://%s:%s' "$(llm_display_host)" "$LLM_PORT"; }
 
 # The llama-server binary, wherever the installer left it. The tarball extracts
 # into a tag-named directory (llama-b11146/), so the path is discovered rather

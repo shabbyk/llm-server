@@ -204,7 +204,7 @@ do_on() {
         echo "           can reach /dev/dri/renderD* (id | grep render)." >&2
 
     if [ "$LLM_ENGINE" = "llamacpp" ]; then
-        echo "  chat UI:   $(llm_url)/"
+        echo "  chat UI:   $(llm_display_url)/"
     fi
 }
 
@@ -287,7 +287,7 @@ do_status() {
     esac
 
     printf '  server:   '
-    if llm_serving; then echo "ON   $(llm_url)"; else echo "OFF  (start with: llm on)"; fi
+    if llm_serving; then echo "ON   $(llm_display_url)"; else echo "OFF  (start with: llm on)"; fi
 
     printf '  model:    '
     if [ "$LLM_ENGINE" = "llamacpp" ]; then
@@ -307,7 +307,7 @@ do_status() {
     [ -n "${mem:-}" ] && printf '  gpu mem:  %s\n' "$mem"
 
     if [ "$LLM_ENGINE" = "llamacpp" ]; then
-        printf '  chat UI:  %s\n' "$(llm_url)/"
+        printf '  chat UI:  %s\n' "$(llm_display_url)/"
     fi
 
     if [ "$LLM_ENGINE" = "ollama" ] && [ -x "$OLLAMA_BIN" ]; then
@@ -354,7 +354,7 @@ do_ui() {
         return 0
     fi
     llm_serving || { echo "llm: not running. Start it with: llm on" >&2; return 1; }
-    printf '%s\n' "$(llm_url)/"
+    printf '%s\n' "$(llm_display_url)/"
 }
 
 # Print the header comment block only, minus the leading "# ".
